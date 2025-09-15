@@ -1,6 +1,7 @@
 import os
 import copy
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -9,7 +10,7 @@ from torchvision.utils import save_image
 import wandb
 
 from model import build_model
-from losses import adv_loss, VGGStyleContentLoss
+from losses import VGGStyleContentLoss
 from utils import EMA
 
 
@@ -56,11 +57,18 @@ class MSIGAN:
         self.current_epoch = 0
     
     def compute_d_loss(self, x_real, y_org, x_ref, y_trg):
-        """Compute discriminator loss."""
+        """Compute discriminator loss with proper shape handling."""
         # Real images from source domain
         x_real.requires_grad_()
         out_real = self.discriminator(x_real, y_org)
-        loss_real = adv_loss(out_real, 1)
+        
+        # Ensure output has correct shape for loss computation
+        if out_real.dim() == 1:
+            out_real = out_real.unsqueeze(-1)  # [B] -> [B, 1]
+        
+        # Use BCEWithLogitsLoss for stability
+        real_labels = torch.ones_like(out_real) #* 0.9  # Label smoothing
+        loss_real = F.binary_cross_entropy_with_logits(out_real, real_labels)
         
         # Fake images translated to target domain
         with torch.no_grad():
@@ -68,7 +76,11 @@ class MSIGAN:
             x_fake = self.generator(x_real, s_trg)
         
         out_fake = self.discriminator(x_fake, y_trg)
-        loss_fake = adv_loss(out_fake, 0)
+        if out_fake.dim() == 1:
+            out_fake = out_fake.unsqueeze(-1)
+        
+        fake_labels = torch.zeros_like(out_fake) #+ 0.1  # Label smoothing
+        loss_fake = F.binary_cross_entropy_with_logits(out_fake, fake_labels)
         
         # Gradient penalty for real images
         loss_gp = self.gradient_penalty(out_real, x_real)
@@ -80,7 +92,7 @@ class MSIGAN:
             'D/fake': loss_fake.item(),
             'D/gp': loss_gp.item()
         }
-    
+
     def compute_g_loss(self, x_real, y_org, x_ref, y_trg, x_ref2):
         """Compute generator and style encoder losses."""
         losses = {}
@@ -90,48 +102,75 @@ class MSIGAN:
         x_fake = self.generator(x_real, s_trg)
         
         # Style reconstruction loss
-        s_pred = self.style_encoder(x_fake, y_trg)
-        loss_sty = torch.mean(torch.abs(s_pred - s_trg))
-        losses['style_recon'] = loss_sty
+        if self.loss_weights.get('style_recon', 0) > 0 or self.loss_weights.get('style_div', 0) > 0:
+            s_pred = self.style_encoder(x_fake, y_trg)
+            loss_sty = torch.mean(torch.abs(s_pred - s_trg))
+            losses['style_recon'] = loss_sty
         
         # Style diversification loss
-        s_trg2 = self.style_encoder(x_ref2, y_trg)
-        x_fake2 = self.generator(x_real, s_trg2)
-        x_fake2 = x_fake2.detach()
-        loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
-        losses['style_div'] = -loss_ds
+            s_trg2 = self.style_encoder(x_ref2, y_trg)
+            x_fake2 = self.generator(x_real, s_trg2)
+            x_fake2 = x_fake2.detach()
+            loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
+            losses['style_div'] = -loss_ds  # Negative because we want to maximize diversity
         
+        else:
+            losses['style_recon'] = torch.tensor(0.0, device=self.device)
+            losses['style_div'] = torch.tensor(0.0, device=self.device)
+
         # Cycle consistency loss (reconstruct source)
         s_org = self.style_encoder(x_real, y_org)
         x_recon = self.generator(x_fake, s_org)
         loss_cyc = torch.mean(torch.abs(x_recon - x_real))
         losses['cycle'] = loss_cyc
         
+        # Identity loss (preserve content when style is from same domain)
+        x_idt = self.generator(x_real, s_org)  # Apply source style to source image
+        loss_idt = torch.mean(torch.abs(x_idt - x_real))
+        losses['identity'] = loss_idt
+        
         # Adversarial loss
         out_fake = self.discriminator(x_fake, y_trg)
-        loss_adv = adv_loss(out_fake, 1)
+        if out_fake.dim() == 1:
+            out_fake = out_fake.unsqueeze(-1)
+        real_labels = torch.ones_like(out_fake)
+        loss_adv = F.binary_cross_entropy_with_logits(out_fake, real_labels)
         losses['gan'] = loss_adv
         
-        # VGG perceptual losses
-        content_loss, style_loss = self.criterion_vgg(x_fake, x_ref, x_real)
-        losses['content'] = content_loss
-        losses['style'] = style_loss
+        # VGG perceptual losses - only compute if weights > 0
+        if self.loss_weights.get('content', 0) > 0 or self.loss_weights.get('style', 0) > 0:
+            content_loss, style_loss = self.criterion_vgg(x_fake, x_ref, x_real)
+            losses['content'] = content_loss
+            losses['style'] = style_loss
+        else:
+            losses['content'] = torch.tensor(0.0, device=self.device)
+            losses['style'] = torch.tensor(0.0, device=self.device)
         
         # Total generator loss
         total_loss = sum(
-            self.loss_weights.get(name, 1.0) * loss 
+            self.loss_weights.get(name, 0.0) * loss 
             for name, loss in losses.items()
+            if self.loss_weights.get(name, 0.0) != 0  # Skip zero-weighted losses
         )
         
         return total_loss, losses
-    
+
     def gradient_penalty(self, d_out, x_in):
-        """Compute gradient penalty for discriminator."""
+        """Compute gradient penalty for discriminator with correct shape handling."""
         batch_size = x_in.size(0)
+        
+        # Handle different output shapes
+        if d_out.dim() > 1:
+            d_out = d_out.mean()  # Reduce to scalar for gradient computation
+        
         grad_dout = torch.autograd.grad(
-            outputs=d_out.sum(), inputs=x_in,
-            create_graph=True, retain_graph=True, only_inputs=True
+            outputs=d_out,
+            inputs=x_in,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
         )[0]
+        
         grad_dout2 = grad_dout.pow(2)
         assert(grad_dout2.size() == x_in.size())
         reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
@@ -268,43 +307,64 @@ def train(model, dataset, cfg, start_epoch=0):
             # Generate samples
             if i % cfg.save_freq == 0:
                 with torch.no_grad():
-                    # Generate translations for multiple source images
-                    all_rows = []
+                    # Use current batch data for more diverse samples
+                    batch_data = next(iter(dataloader))
                     
-                    for src_idx in range(min(2, len(fixed_samples['source']))):
-                        source = fixed_samples['source'][src_idx].to(model.device)
+                    all_rows = []
+                    num_samples_per_domain = 2
+                    
+                    # For each source sample
+                    for src_idx in range(min(num_samples_per_domain, batch_data['source'].size(0))):
+                        source = batch_data['source'][src_idx:src_idx+1].to(model.device)
                         
-                        # Row: source + translations to each domain
-                        row = [source.unsqueeze(0)]  # Include source
+                        # Create row: source + translations to each target domain
+                        row = [source]
                         
-                        for domain_idx, targets in fixed_samples['targets'].items():
-                            if len(targets) > 0:
-                                ref = targets[0].unsqueeze(0).to(model.device)
+                        # Generate translation to each target domain
+                        for domain_idx in range(1, dataset.num_domains):  # Skip source domain (0)
+                            # Get a random reference from this domain
+                            if domain_idx in fixed_samples['targets'] and len(fixed_samples['targets'][domain_idx]) > 0:
+                                # Use different reference images for variety
+                                ref_idx = i % len(fixed_samples['targets'][domain_idx])
+                                ref = fixed_samples['targets'][domain_idx][ref_idx].unsqueeze(0).to(model.device)
                                 y_trg = torch.tensor([domain_idx], device=model.device)
                                 
+                                # Extract style and generate
                                 s = model.ema_style_encoder(ref, y_trg)
-                                fake = model.ema_generator(source.unsqueeze(0), s)
+                                fake = model.ema_generator(source, s)
                                 row.append(fake)
                         
-                        all_rows.append(torch.cat(row, dim=0))
+                        if len(row) > 1:  # Only add if we have translations
+                            all_rows.append(torch.cat(row, dim=0))
                     
-                    # Combine all rows
-                    samples_grid = torch.cat(all_rows, dim=0)
+                    if all_rows:
+                        samples_grid = torch.cat(all_rows, dim=0)
+                        
+                        # Save with informative filename
+                        save_image(
+                            samples_grid,
+                            os.path.join(sample_dir, f'epoch_{epoch+1:03d}_iter_{i:05d}.png'),
+                            nrow=dataset.num_domains,  # One column per domain
+                            normalize=True,
+                            value_range=(-1, 1)
+                        )
+                        
+                        # Also save individual translations for better inspection
+                        if epoch % 10 == 0:  # Every 10 epochs
+                            for row_idx, row_tensor in enumerate(all_rows):
+                                save_image(
+                                    row_tensor,
+                                    os.path.join(sample_dir, f'epoch_{epoch+1:03d}_sample_{row_idx}.png'),
+                                    nrow=dataset.num_domains,
+                                    normalize=True,
+                                    value_range=(-1, 1)
+                                )
                     
-                    # Save grid
-                    save_image(
-                        samples_grid,
-                        os.path.join(sample_dir, f'epoch_{epoch+1:03d}_iter_{i:05d}.png'),
-                        nrow=len(fixed_samples['targets']) + 1,  # source + target domains
-                        normalize=True,
-                        value_range=(-1, 1)
-                    )
-                    
-                    # W&B: Log samples
-                    # if cfg.wandb:
-                    #     wandb.log({
-                    #         'samples': wandb.Image(samples_grid, caption=f'Epoch {epoch+1}')
-                    #     })
+                        # # W&B: Log samples
+                        # if cfg.wandb:
+                        #     wandb.log({
+                        #         'samples': wandb.Image(samples_grid, caption=f'Epoch {epoch+1}')
+                        #     })
         
         # Epoch-level operations
         # Calculate average losses

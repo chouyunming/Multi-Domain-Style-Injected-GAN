@@ -22,7 +22,7 @@ SAVE_FREQ = 100
 
 # Learning rates
 LEARNING_RATE_G = 1e-4  
-LEARNING_RATE_D = 1e-4  
+LEARNING_RATE_D = 1e-6  
 
 # Loss weights
 LOSS_WEIGHTS = {
@@ -30,6 +30,7 @@ LOSS_WEIGHTS = {
     'style_recon': 1.0,  # Style reconstruction loss
     'style_div': 1.0,     # Style diversification loss
     'cycle': 1.0,        # Cycle consistency loss
+    'identity': 1.0,     # Identity loss'
     'content': 0.0,       # Content preservation (from VGG)
     'style': 0.0          # Style matching (from VGG)
 }

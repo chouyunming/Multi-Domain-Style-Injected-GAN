@@ -203,6 +203,7 @@ class StyleEncoder(nn.Module):
 class Discriminator(nn.Module):
     """
     Multi-task discriminator for multiple domains.
+    Fixed to handle feature map sizes correctly.
     """
     def __init__(self, img_size=256, num_domains=2, max_conv_dim=512):
         super().__init__()
@@ -212,14 +213,22 @@ class Discriminator(nn.Module):
         blocks = []
         blocks.append(nn.Conv2d(3, dim_in, 3, 1, 1))
         
-        repeat_num = int(np.log2(img_size)) - 2
+        # Calculate number of downsampling blocks more carefully
+        # We want to end up with at least 4x4 spatial dimensions
+        min_feat_size = 4
+        repeat_num = int(np.log2(img_size // min_feat_size))
+        
         for _ in range(repeat_num):
             dim_out = min(dim_in * 2, max_conv_dim)
             blocks.append(ResBlk(dim_in, dim_out, downsample=True))
             dim_in = dim_out
         
         blocks.append(nn.LeakyReLU(0.2))
-        blocks.append(nn.Conv2d(dim_out, dim_out, 4, 1, 0))
+        
+        # Instead of using a 4x4 conv that requires exactly 4x4 input,
+        # use adaptive pooling to handle any size, then a 1x1 conv
+        blocks.append(nn.AdaptiveAvgPool2d((1, 1)))
+        blocks.append(nn.Conv2d(dim_out, dim_out, 1, 1, 0))
         blocks.append(nn.LeakyReLU(0.2))
         
         self.shared = nn.Sequential(*blocks)
@@ -227,7 +236,7 @@ class Discriminator(nn.Module):
         # Domain-specific output branches
         self.unshared = nn.ModuleList()
         for _ in range(num_domains):
-            self.unshared.append(nn.Conv2d(dim_out, 1, 1, 1, 0))
+            self.unshared.append(nn.Linear(dim_out, 1))  # Use Linear instead of Conv2d
     
     def forward(self, x, y):
         """
@@ -235,20 +244,20 @@ class Discriminator(nn.Module):
         y: domain indices [B] (LongTensor)
         Returns: discrimination scores [B]
         """
-        h = self.shared(x)
+        h = self.shared(x)  # [B, dim_out, 1, 1]
+        h = h.view(h.size(0), -1)  # [B, dim_out]
         
         # Collect outputs from all branches
         out = []
         for layer in self.unshared:
             out.append(layer(h))
-        out = torch.cat(out, dim=1)  # [B, num_domains, h, w]
+        out = torch.stack(out, dim=1)  # [B, num_domains, 1]
         
         # Select the appropriate output for each sample
         idx = torch.arange(y.size(0), device=y.device)
-        out = out[idx, y]  # [B, h, w]
+        out = out[idx, y].squeeze(-1)  # [B]
         
-        return out.view(out.size(0), -1).mean(dim=1)  # [B]
-
+        return out
 
 def build_model(img_size, style_dim, num_domains, device):
     """Build all model components."""

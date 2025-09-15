@@ -3,12 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-def adv_loss(logits, target):
-    assert target in [1, 0]
-    targets = torch.full_like(logits, fill_value=target)
-    loss = F.binary_cross_entropy_with_logits(logits, targets)
-    return loss
-
 class VGGStyleContentLoss(nn.Module):
     """
     Computes perceptual style and content losses using a pre-trained VGG19 network.

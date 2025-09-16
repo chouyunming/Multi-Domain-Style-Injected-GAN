@@ -1,268 +1,214 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+import config as default_config
+
+# ######################################################################
+# ###########  Building Blocks for the Style-based Generator ###########
+# ######################################################################
 
 class AdaIN(nn.Module):
-    """Adaptive Instance Normalization layer."""
-    def __init__(self, num_features, style_dim):
+    """
+    Adaptive Instance Normalization (AdaIN) block.
+    This layer adjusts the style of the content features based on a given style code.
+    """
+    def __init__(self, content_channels, style_dim):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
-        self.fc = nn.Linear(style_dim, num_features * 2)
+        self.instance_norm = nn.InstanceNorm2d(content_channels, affine=False)
+        # A linear layer to produce the modulation parameters (gamma and beta)
+        self.style_modulation = nn.Linear(style_dim, content_channels * 2)
+
+    def forward(self, content_features, style_code):
+        normalized_content = self.instance_norm(content_features)
         
-    def forward(self, x, s):
-        """
-        x: content features [B, C, H, W]
-        s: style code [B, style_dim]
-        """
-        h = self.fc(s)
-        h = h.view(h.size(0), -1, 1, 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        # Handle both [B, D] and [B, D, 1, 1] style code formats
+        if len(style_code.shape) == 4:
+            style_code = style_code.squeeze(-1).squeeze(-1)
+        
+        # Split the style parameters into gamma and beta
+        style_params = self.style_modulation(style_code)
+        gamma, beta = style_params.chunk(2, dim=1)
+        
+        # Reshape gamma and beta to match content feature dimensions for broadcasting
+        gamma = gamma.view(gamma.size(0), gamma.size(1), 1, 1)
+        beta = beta.view(beta.size(0), beta.size(1), 1, 1)
+        
+        # Apply the style modulation
+        return gamma * normalized_content + beta
 
-
-class ResBlk(nn.Module):
-    """Residual block with optional downsampling."""
-    def __init__(self, dim_in, dim_out, downsample=False):
+class ResidualBlockWithAdaIN(nn.Module):
+    """
+    A residual block that incorporates AdaIN layers.
+    This allows the style to be injected at multiple points in the generator.
+    """
+    def __init__(self, channels, style_dim):
         super().__init__()
-        self.downsample = downsample
-        self.learned_sc = dim_in != dim_out
-        
-        self.conv1 = nn.Conv2d(dim_in, dim_in, 3, 1, 1)
-        self.conv2 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        self.norm1 = nn.InstanceNorm2d(dim_in, affine=True)
-        self.norm2 = nn.InstanceNorm2d(dim_in, affine=True)
-        self.actv = nn.LeakyReLU(0.2)
-        
-        if self.learned_sc:
-            self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
-    
-    def forward(self, x):
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.adain1 = AdaIN(channels, style_dim)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.adain2 = AdaIN(channels, style_dim)
+
+    def forward(self, x, style_code):
         residual = x
-        
-        out = self.actv(self.norm1(x))
-        out = self.conv1(out)
-        if self.downsample:
-            out = F.avg_pool2d(out, 2)
-            residual = F.avg_pool2d(residual, 2)
-        
-        out = self.actv(self.norm2(out))
-        out = self.conv2(out)
-        
-        if self.learned_sc:
-            residual = self.conv1x1(residual)
-            
-        return (out + residual) / np.sqrt(2)
+        out = self.relu1(self.adain1(self.conv1(x), style_code))
+        out = self.adain2(self.conv2(out), style_code)
+        return out + residual
 
+# ######################################################################
+# ###################  Main Network Architectures ######################
+# ######################################################################
 
-class AdaINResBlk(nn.Module):
-    """Residual block with AdaIN for style injection."""
-    def __init__(self, dim_in, dim_out, style_dim=64, upsample=False):
+class MultiDomainStyleEncoder(nn.Module):
+    """
+    Multi-domain style encoder with domain-specific branches.
+    Each domain has its own output branch while sharing lower-level features.
+    """
+    def __init__(self, style_dim=256, num_domains=2):
         super().__init__()
-        self.upsample = upsample
-        self.learned_sc = dim_in != dim_out
-        
-        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
-        self.norm1 = AdaIN(dim_in, style_dim)
-        self.norm2 = AdaIN(dim_out, style_dim)
-        self.actv = nn.LeakyReLU(0.2)
-        
-        if self.learned_sc:
-            self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
-    
-    def forward(self, x, s):
-        """
-        x: input features
-        s: style code
-        """
-        residual = x
-        
-        out = self.actv(self.norm1(x, s))
-        if self.upsample:
-            out = F.interpolate(out, scale_factor=2, mode='nearest')
-            residual = F.interpolate(residual, scale_factor=2, mode='nearest')
-        out = self.conv1(out)
-        out = self.actv(self.norm2(out, s))
-        out = self.conv2(out)
-        
-        if self.learned_sc:
-            residual = self.conv1x1(residual)
-            
-        return (out + residual) / np.sqrt(2)
-
-
-class Generator(nn.Module):
-    """
-    Multi-domain generator that translates images using style codes.
-    Architecture inspired by StarGAN v2.
-    """
-    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512):
-        super().__init__()
-        dim_in = 64
-        self.img_size = img_size
-        self.style_dim = style_dim
-        
-        # From RGB
-        self.from_rgb = nn.Conv2d(3, dim_in, 3, 1, 1)
-        
-        # Encoder (downsampling)
-        self.encode = nn.ModuleList()
-        self.decode = nn.ModuleList()
-        
-        # Calculate number of downsampling blocks
-        repeat_num = int(np.log2(img_size)) - 4
-        
-        for _ in range(repeat_num):
-            dim_out = min(dim_in * 2, max_conv_dim)
-            self.encode.append(ResBlk(dim_in, dim_out, downsample=True))
-            self.decode.insert(0, AdaINResBlk(dim_out, dim_in, style_dim, upsample=True))
-            dim_in = dim_out
-        
-        # Bottleneck blocks
-        for _ in range(2):
-            self.encode.append(ResBlk(dim_out, dim_out))
-            self.decode.insert(0, AdaINResBlk(dim_out, dim_out, style_dim))
-        
-        # To RGB
-        self.to_rgb = nn.Sequential(
-            nn.InstanceNorm2d(64, affine=True),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 3, 1, 1, 0),
-            nn.Tanh()
-        )
-    
-    def forward(self, x, s):
-        """
-        x: input image [B, 3, H, W]
-        s: style code [B, style_dim]
-        """
-        # Encode
-        x = self.from_rgb(x)
-        for block in self.encode:
-            x = block(x)
-        
-        # Decode with style injection
-        for block in self.decode:
-            x = block(x, s)
-        
-        return self.to_rgb(x)
-
-
-class StyleEncoder(nn.Module):
-    """
-    Multi-domain style encoder with separate output branches for each domain.
-    """
-    def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512):
-        super().__init__()
-        dim_in = 64
-        
-        # Shared layers
-        shared_layers = []
-        shared_layers.append(nn.Conv2d(3, dim_in, 3, 1, 1))
-        
-        repeat_num = int(np.log2(img_size)) - 2
-        for _ in range(repeat_num):
-            dim_out = min(dim_in * 2, max_conv_dim)
-            shared_layers.append(ResBlk(dim_in, dim_out, downsample=True))
-            dim_in = dim_out
-        
-        shared_layers.append(nn.LeakyReLU(0.2))
-        shared_layers.append(nn.Conv2d(dim_out, dim_out, 4, 1, 0))
-        shared_layers.append(nn.LeakyReLU(0.2))
-        
-        self.shared = nn.Sequential(*shared_layers)
-        
-        # Domain-specific output branches
-        self.unshared = nn.ModuleList()
-        for _ in range(num_domains):
-            self.unshared.append(nn.Linear(dim_out, style_dim))
-    
-    def forward(self, x, y):
-        """
-        x: input image [B, 3, H, W]
-        y: domain indices [B] (LongTensor)
-        Returns: style codes [B, style_dim]
-        """
-        h = self.shared(x)
-        h = h.view(h.size(0), -1)
-        
-        # Collect outputs from all branches
-        out = []
-        for layer in self.unshared:
-            out.append(layer(h))
-        out = torch.stack(out, dim=1)  # [B, num_domains, style_dim]
-        
-        # Select the appropriate style code for each sample
-        idx = torch.arange(y.size(0), device=y.device)
-        s = out[idx, y]  # [B, style_dim]
-        
-        return s
-
-
-class Discriminator(nn.Module):
-    """
-    Multi-task discriminator for multiple domains.
-    Fixed to handle feature map sizes correctly.
-    """
-    def __init__(self, img_size=256, num_domains=2, max_conv_dim=512):
-        super().__init__()
-        dim_in = 64
+        self.num_domains = num_domains
         
         # Shared convolutional layers
-        blocks = []
-        blocks.append(nn.Conv2d(3, dim_in, 3, 1, 1))
-        
-        # Calculate number of downsampling blocks more carefully
-        # We want to end up with at least 4x4 spatial dimensions
-        min_feat_size = 4
-        repeat_num = int(np.log2(img_size // min_feat_size))
-        
-        for _ in range(repeat_num):
-            dim_out = min(dim_in * 2, max_conv_dim)
-            blocks.append(ResBlk(dim_in, dim_out, downsample=True))
-            dim_in = dim_out
-        
-        blocks.append(nn.LeakyReLU(0.2))
-        
-        # Instead of using a 4x4 conv that requires exactly 4x4 input,
-        # use adaptive pooling to handle any size, then a 1x1 conv
-        blocks.append(nn.AdaptiveAvgPool2d((1, 1)))
-        blocks.append(nn.Conv2d(dim_out, dim_out, 1, 1, 0))
-        blocks.append(nn.LeakyReLU(0.2))
-        
-        self.shared = nn.Sequential(*blocks)
+        self.shared_layers = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1)
+        )
         
         # Domain-specific output branches
-        self.unshared = nn.ModuleList()
+        self.domain_branches = nn.ModuleList()
         for _ in range(num_domains):
-            self.unshared.append(nn.Linear(dim_out, 1))  # Use Linear instead of Conv2d
-    
-    def forward(self, x, y):
+            self.domain_branches.append(
+                nn.Sequential(
+                    nn.Conv2d(512, style_dim, kernel_size=1),
+                    nn.Flatten()
+                )
+            )
+
+    def forward(self, img, domain_idx=None):
         """
-        x: input image [B, 3, H, W]
-        y: domain indices [B] (LongTensor)
-        Returns: discrimination scores [B]
+        Args:
+            img: input image [B, 3, H, W]
+            domain_idx: domain indices [B] (LongTensor) or None for single domain
+        Returns:
+            style codes [B, style_dim]
         """
-        h = self.shared(x)  # [B, dim_out, 1, 1]
-        h = h.view(h.size(0), -1)  # [B, dim_out]
+        # Extract shared features
+        shared_features = self.shared_layers(img)
+        
+        if domain_idx is None:
+            # Single domain case - use first branch
+            return self.domain_branches[0](shared_features)
+        
+        # Multi-domain case - select appropriate branch for each sample
+        batch_size = img.size(0)
+        style_codes = []
         
         # Collect outputs from all branches
-        out = []
-        for layer in self.unshared:
-            out.append(layer(h))
-        out = torch.stack(out, dim=1)  # [B, num_domains, 1]
+        all_outputs = []
+        for branch in self.domain_branches:
+            all_outputs.append(branch(shared_features))
+        all_outputs = torch.stack(all_outputs, dim=1)  # [B, num_domains, style_dim]
         
         # Select the appropriate output for each sample
-        idx = torch.arange(y.size(0), device=y.device)
-        out = out[idx, y].squeeze(-1)  # [B]
+        idx = torch.arange(batch_size, device=img.device)
+        style_codes = all_outputs[idx, domain_idx]  # [B, style_dim]
         
-        return out
+        return style_codes
 
-def build_model(img_size, style_dim, num_domains, device):
-    """Build all model components."""
-    generator = Generator(img_size, style_dim).to(device)
-    style_encoder = StyleEncoder(img_size, style_dim, num_domains).to(device)
-    discriminator = Discriminator(img_size, num_domains).to(device)
-    
-    return generator, style_encoder, discriminator
+
+class StyleCycleGANGenerator(nn.Module):
+    """
+    The main generator network for StyleCycleGAN.
+    It separates content and style, encoding the content and then injecting
+    the style via AdaIN residual blocks in the decoder.
+    """
+    def __init__(self, in_channels=3, out_channels=3, style_dim=256, n_residual_blocks=default_config.N_RESIDUAL_BLOCKS):
+        super().__init__()
+        # Content Encoder: Extracts style-invariant content features
+        self.content_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 7, 1, 3, padding_mode='reflect'), nn.InstanceNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 4, 2, 1), nn.InstanceNorm2d(256), nn.ReLU(inplace=True)
+        )
+        
+        # Decoder: Synthesizes an image from content features and a style code
+        decoder_blocks = [ResidualBlockWithAdaIN(256, style_dim) for _ in range(n_residual_blocks)]
+        decoder_blocks.extend([
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.InstanceNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, out_channels, 7, 1, 3, padding_mode='reflect'), nn.Tanh()
+        ])
+        self.decoder = nn.ModuleList(decoder_blocks)
+
+    def forward(self, content_image, style_code):
+        content_features = self.content_encoder(content_image)
+        x = content_features
+        for layer in self.decoder:
+            # Apply style code only to the AdaIN residual blocks
+            x = layer(x, style_code) if isinstance(layer, ResidualBlockWithAdaIN) else layer(x)
+        return x
+
+
+class MultiDomainDiscriminator(nn.Module):
+    """
+    Multi-domain PatchGAN-style discriminator with domain-specific branches.
+    Each domain has its own output head while sharing feature extraction.
+    """
+    def __init__(self, in_channels=3, num_domains=2):
+        super().__init__()
+        self.num_domains = num_domains
+        
+        # Shared feature extraction layers
+        def discriminator_block(in_feat, out_feat, normalize=True):
+            layers = [nn.Conv2d(in_feat, out_feat, 4, 2, 1)]
+            if normalize: 
+                layers.append(nn.InstanceNorm2d(out_feat))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+        
+        self.shared_layers = nn.Sequential(
+            *discriminator_block(in_channels, 64, normalize=False), 
+            *discriminator_block(64, 128), 
+            *discriminator_block(128, 256), 
+            *discriminator_block(256, 512),
+        )
+        
+        # Domain-specific output branches
+        self.domain_branches = nn.ModuleList()
+        for _ in range(num_domains):
+            self.domain_branches.append(nn.Sequential(
+                nn.ZeroPad2d((1, 0, 1, 0)), 
+                nn.Conv2d(512, 1, 4, padding=1)
+            ))
+
+    def forward(self, img, domain_idx=None):
+        """
+        Args:
+            img: input image [B, 3, H, W]
+            domain_idx: domain indices [B] (LongTensor) or None for single domain
+        Returns:
+            discrimination scores [B, 1, H, W] or [B] depending on domain_idx
+        """
+        # Extract shared features
+        shared_features = self.shared_layers(img)
+        
+        if domain_idx is None:
+            # Single domain case - use first branch
+            return self.domain_branches[0](shared_features)
+        
+        # Multi-domain case - select appropriate branch for each sample
+        batch_size = img.size(0)
+        
+        # Collect outputs from all branches
+        all_outputs = []
+        for branch in self.domain_branches:
+            all_outputs.append(branch(shared_features))
+        all_outputs = torch.stack(all_outputs, dim=1)  # [B, num_domains, 1, H, W]
+        
+        # Select the appropriate output for each sample
+        idx = torch.arange(batch_size, device=img.device)
+        outputs = all_outputs[idx, domain_idx]  # [B, 1, H, W]
+        
+        return outputs

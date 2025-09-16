@@ -1,400 +1,360 @@
+# trainer.py
 import os
 import copy
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from torchvision.utils import save_image
+
+# W&B for experiment tracking
 import wandb
 
-from model import build_model
+# Import from our new modules
+from model import StyleCycleGANGenerator, MultiDomainStyleEncoder, MultiDomainDiscriminator
 from losses import VGGStyleContentLoss
-from utils import EMA, DynamicWeightScheduler
+from utils import EMA, DynamicWeightScheduler, save_sample_grid
 
-class MSIGAN:
-    def __init__(self, img_size, style_dim, num_domains, device, lr_g, lr_d, 
-                 loss_weights, total_epochs):
+class MultiDomainStyleCycleGAN:
+    """
+    Multi-domain StyleCycleGAN trainer.
+    This extends the original StyleCycleGAN to work with multiple target domains
+    using domain-specific branches in the style encoder and discriminator.
+    """
+    def __init__(self, device, total_epochs, lr_g, lr_d, loss_weights, num_domains):
         self.device = device
         self.num_domains = num_domains
-        self.loss_weights = loss_weights
-        
-        # Build models
-        self.generator, self.style_encoder, self.discriminator = build_model(
-            img_size, style_dim, num_domains, device
-        )
-        
-        # EMA models for stable inference
-        self.ema = EMA(beta=0.999)
-        self.ema_generator = copy.deepcopy(self.generator).eval()
-        self.ema_style_encoder = copy.deepcopy(self.style_encoder).eval()
-        
-        # Loss functions
-        self.criterion_vgg = VGGStyleContentLoss(device)
-        
-        # Initialize DynamicWeightScheduler
-        scheduled_weights = {k: v for k, v in loss_weights.items() if k != 'gan'}
-        self.weight_scheduler = DynamicWeightScheduler(
-            init_weights=scheduled_weights,
-            warmup_epochs=20,
-            decay_epochs=100,
-            total_epochs=total_epochs
-        )
-        
-        # Optimizers
-        g_params = list(self.generator.parameters()) + list(self.style_encoder.parameters())
-        self.g_optimizer = torch.optim.Adam(g_params, lr=lr_g, betas=(0.0, 0.99))
-        self.d_optimizer = torch.optim.Adam(
-            self.discriminator.parameters(), lr=lr_d, betas=(0.0, 0.99)
-        )
-        
-        # Learning rate schedulers
-        self.g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.g_optimizer, T_max=total_epochs, eta_min=1e-6
-        )
-        self.d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.d_optimizer, T_max=total_epochs, eta_min=1e-6
-        )
-        
-        self.loss_history = {}
-        self.current_epoch = 0
-    
-    def compute_d_loss(self, x_real, y_org, x_ref, y_trg):
-        """Computes discriminator loss"""
-        x_real.requires_grad_()
-        out_real = self.discriminator(x_real, y_org)
-        
-        if out_real.dim() == 1:
-            out_real = out_real.unsqueeze(-1)
-        
-        real_labels = torch.ones_like(out_real) * 0.9
-        loss_real = F.binary_cross_entropy_with_logits(out_real, real_labels)
-        
-        with torch.no_grad():
-            s_trg = self.style_encoder(x_ref, y_trg)
-            x_fake = self.generator(x_real, s_trg)
-        
-        out_fake = self.discriminator(x_fake, y_trg)
-        if out_fake.dim() == 1:
-            out_fake = out_fake.unsqueeze(-1)
-        
-        fake_labels = torch.zeros_like(out_fake) + 0.1
-        loss_fake = F.binary_cross_entropy_with_logits(out_fake, fake_labels)
-        
-        loss_gp = self.gradient_penalty(out_real, x_real)
-        
-        loss = loss_real + loss_fake + 1.0 * loss_gp
-        
-        return loss, {
-            'D/real': loss_real.item(),
-            'D/fake': loss_fake.item(),
-            'D/gp': loss_gp.item()
-        }
 
-    def compute_g_loss(self, x_real, y_org, x_ref, y_trg, x_ref2, dynamic_weights=None):
-        """Computes generator and style encoder losses using dynamic weights"""
-        losses = {}
+        # --- Instantiate Models ---
+        # Generators (unchanged - they work with style codes)
+        self.G_A2B = StyleCycleGANGenerator().to(device)
+        self.G_B2A = StyleCycleGANGenerator().to(device)
         
-        weights = {**dynamic_weights, 'gan': self.loss_weights.get('gan', 1.0)} if dynamic_weights else self.loss_weights
+        # Multi-domain Style Encoders
+        self.SE_A = MultiDomainStyleEncoder(num_domains=num_domains).to(device)
+        self.SE_B = MultiDomainStyleEncoder(num_domains=num_domains).to(device)
         
-        s_trg = self.style_encoder(x_ref, y_trg)
-        x_fake = self.generator(x_real, s_trg)
-        
-        if weights.get('style_recon', 0) > 0:
-            s_pred = self.style_encoder(x_fake, y_trg)
-            losses['style_recon'] = torch.mean(torch.abs(s_pred - s_trg))
-        else:
-            losses['style_recon'] = torch.tensor(0.0, device=self.device)
-        
-        if weights.get('style_div', 0) > 0:
-            s_trg2 = self.style_encoder(x_ref2, y_trg)
-            x_fake2 = self.generator(x_real, s_trg2)
-            losses['style_div'] = -torch.mean(torch.abs(x_fake - x_fake2.detach()))
-        else:
-            losses['style_div'] = torch.tensor(0.0, device=self.device)
+        # Multi-domain Discriminators
+        self.D_A = MultiDomainDiscriminator(num_domains=num_domains).to(device)
+        self.D_B = MultiDomainDiscriminator(num_domains=num_domains).to(device)
 
-        if weights.get('cycle', 0) > 0:
-            s_org = self.style_encoder(x_real, y_org)
-            x_recon = self.generator(x_fake, s_org)
-            losses['cycle'] = torch.mean(torch.abs(x_recon - x_real))
-        else:
-            losses['cycle'] = torch.tensor(0.0, device=self.device)
-        
-        if weights.get('identity', 0) > 0:
-            s_org = self.style_encoder(x_real, y_org)
-            x_idt = self.generator(x_real, s_org)
-            losses['identity'] = torch.mean(torch.abs(x_idt - x_real))
-        else:
-            losses['identity'] = torch.tensor(0.0, device=self.device)
-        
-        out_fake = self.discriminator(x_fake, y_trg)
-        if out_fake.dim() == 1:
-            out_fake = out_fake.unsqueeze(-1)
-        losses['gan'] = F.binary_cross_entropy_with_logits(out_fake, torch.ones_like(out_fake))
-        
-        if weights.get('content', 0) > 0 or weights.get('style', 0) > 0:
-            content_loss, style_loss = self.criterion_vgg(x_fake, x_ref, x_real)
-            losses['content'] = content_loss
-            losses['style'] = style_loss
-        else:
-            losses['content'] = torch.tensor(0.0, device=self.device)
-            losses['style'] = torch.tensor(0.0, device=self.device)
-        
-        total_loss = sum(weights.get(name, 0.0) * loss for name, loss in losses.items() if weights.get(name, 0.0) != 0)
-        
-        return total_loss, losses
+        # --- Instantiate EMA Models for Inference ---
+        self.ema = EMA(beta=0.995)
+        self.ema_G_A2B = copy.deepcopy(self.G_A2B).eval()
+        self.ema_G_B2A = copy.deepcopy(self.G_B2A).eval()
+        self.ema_SE_A = copy.deepcopy(self.SE_A).eval()
+        self.ema_SE_B = copy.deepcopy(self.SE_B).eval()
 
-    def gradient_penalty(self, d_out, x_in):
-        """Computes the gradient penalty for the discriminator"""
-        batch_size = x_in.size(0)
-        if d_out.dim() > 1:
-            d_out = d_out.mean()
-        
-        grad_dout = torch.autograd.grad(
-            outputs=d_out, inputs=x_in, create_graph=True, retain_graph=True, only_inputs=True
-        )[0]
-        
-        grad_dout2 = grad_dout.pow(2)
-        assert(grad_dout2.size() == x_in.size())
-        reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
-        return reg
-    
-    def train_d_step(self, batch):
-        """A single training step for the discriminator"""
-        x_real = batch['source'].to(self.device)
-        x_ref = batch['target'].to(self.device)
-        y_org = batch['source_domain'].to(self.device)
-        y_trg = batch['target_domain'].to(self.device)
-        
-        self.d_optimizer.zero_grad()
-        d_loss, d_losses_log = self.compute_d_loss(x_real, y_org, x_ref, y_trg)
-        d_loss.backward()
-        self.d_optimizer.step()
-        
-        return d_losses_log
+        # --- Define Loss Functions ---
+        self.criterion_gan = nn.MSELoss().to(device)
+        self.criterion_cycle = nn.L1Loss().to(device)
+        self.criterion_identity = nn.L1Loss().to(device)
+        self.criterion_style_content = VGGStyleContentLoss(device).to(device)
 
-    def train_g_step(self, batch, dynamic_weights=None):
-        """A single training step for the generator"""
-        x_real = batch['source'].to(self.device)
-        x_ref = batch['target'].to(self.device)
-        x_ref2 = batch['target2'].to(self.device)
-        y_org = batch['source_domain'].to(self.device)
-        y_trg = batch['target_domain'].to(self.device)
+        # --- Define Optimizers ---
+        g_params = list(self.G_A2B.parameters()) + list(self.G_B2A.parameters()) + \
+                   list(self.SE_A.parameters()) + list(self.SE_B.parameters())
+        self.g_optimizer = torch.optim.Adam(g_params, lr=lr_g, betas=(0.5, 0.999))
         
+        d_params = list(self.D_A.parameters()) + list(self.D_B.parameters())
+        self.d_optimizer = torch.optim.Adam(d_params, lr=lr_d, betas=(0.5, 0.999))
+
+        # --- Define Learning Rate Schedulers ---
+        self.g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.g_optimizer, T_max=total_epochs, eta_min=1e-6)
+        self.d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.d_optimizer, T_max=total_epochs, eta_min=1e-6)
+        
+        # --- Initialize Dynamic Loss Weighting ---
+        self.weight_scheduler = DynamicWeightScheduler(loss_weights, warmup_epochs=10, decay_epochs=100, total_epochs=total_epochs)
+
+        # --- Loss History Tracking ---
+        self.loss_history = {k: [] for k in (list(loss_weights.keys()) + ['D_loss', 'G_loss'])}
+        self.current_epoch_losses = {k: [] for k in self.loss_history.keys()}
+
+    def train_step(self, batch, epoch):
+        """
+        Training step modified to handle multi-domain data.
+        """
+        # Extract data from batch
+        real_A = batch['source'].to(self.device)  # Source domain images
+        real_B = batch['target'].to(self.device)  # Target domain images
+        y_org = batch['source_domain'].to(self.device)  # Source domain indices (always 0)
+        y_trg = batch['target_domain'].to(self.device)  # Target domain indices
+        
+        # Adversarial ground truths
+        valid = torch.ones((real_A.size(0), 1, *self.D_A(real_A, y_org).shape[2:]), device=self.device)
+        fake = torch.zeros_like(valid)
+
+        # ==================================
+        #        Train Generators
+        # ==================================
         self.g_optimizer.zero_grad()
-        g_loss, g_losses_raw = self.compute_g_loss(
-            x_real, y_org, x_ref, y_trg, x_ref2, 
-            dynamic_weights=dynamic_weights
-        )
+        
+        # Extract style codes using domain indices
+        style_A = self.SE_A(real_A, y_org)  # Style of source images
+        style_B = self.SE_B(real_B, y_trg)  # Style of target images
+
+        # Identity loss: G(B, style_B) should be B for same domain
+        # Only compute identity loss for target domain images
+        loss_identity = self.criterion_identity(self.G_A2B(real_B, style_B), real_B)
+
+        # GAN loss, Style loss, and Content loss
+        fake_B = self.G_A2B(real_A, style_B)  # Translate A to B's style
+        loss_gan_A2B = self.criterion_gan(self.D_B(fake_B, y_trg), valid)
+        content_loss_B, style_loss_B = self.criterion_style_content(fake_B, real_B, real_A)
+        
+        # For reverse direction, we translate back to source domain
+        fake_A = self.G_B2A(real_B, style_A)  # Translate B to A's style
+        loss_gan_B2A = self.criterion_gan(self.D_A(fake_A, y_org), valid)
+        content_loss_A, style_loss_A = self.criterion_style_content(fake_A, real_A, real_B)
+        
+        loss_gan = (loss_gan_A2B + loss_gan_B2A) / 2
+        loss_style = (style_loss_A + style_loss_B) / 2
+        loss_content = (content_loss_A + content_loss_B) / 2
+
+        # Cycle-consistency loss
+        loss_cycle = (self.criterion_cycle(self.G_B2A(fake_B, style_A), real_A) + \
+                      self.criterion_cycle(self.G_A2B(fake_A, style_B), real_B)) / 2
+        
+        # Total generator loss with dynamic weights
+        individual_losses = {'gan': loss_gan, 'cycle': loss_cycle, 'identity': loss_identity, 
+                           'style': loss_style, 'content': loss_content}
+        weights = self.weight_scheduler.get_current_weights(epoch, individual_losses)
+        g_loss = sum(loss * weights[name] for name, loss in individual_losses.items())
+        
         g_loss.backward()
+        # Apply gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.g_optimizer.param_groups[0]['params'], 1.0)
         self.g_optimizer.step()
-        
-        self.ema.update_model_average(self.ema_generator, self.generator)
-        self.ema.update_model_average(self.ema_style_encoder, self.style_encoder)
-        
-        g_losses_log = {}
-        for name, loss in g_losses_raw.items():
-            g_losses_log[f'G/{name}'] = loss.item() if torch.is_tensor(loss) else loss
-        g_losses_log['G/total'] = g_loss.item()
-        
-        return g_losses_log, g_losses_raw
 
-    def save_checkpoint(self, save_dir, epoch):
-        """Saves a model checkpoint"""
+        # Update EMA models after generator step
+        self.ema.update_model_average(self.ema_G_A2B, self.G_A2B)
+        self.ema.update_model_average(self.ema_G_B2A, self.G_B2A)
+        self.ema.update_model_average(self.ema_SE_A, self.SE_A)
+        self.ema.update_model_average(self.ema_SE_B, self.SE_B)
+
+        # ==================================
+        #      Train Discriminators
+        # ==================================
+        self.d_optimizer.zero_grad()
+        
+        # Real loss
+        loss_real_A = self.criterion_gan(self.D_A(real_A, y_org), valid)
+        loss_real_B = self.criterion_gan(self.D_B(real_B, y_trg), valid)
+        
+        # Fake loss
+        loss_fake_A = self.criterion_gan(self.D_A(fake_A.detach(), y_org), fake)
+        loss_fake_B = self.criterion_gan(self.D_B(fake_B.detach(), y_trg), fake)
+        
+        d_loss = (loss_real_A + loss_fake_A + loss_real_B + loss_fake_B) / 2
+        
+        d_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.d_optimizer.param_groups[0]['params'], 1.0)
+        self.d_optimizer.step()
+
+        return {'D_loss': d_loss, 'G_loss': g_loss, **individual_losses}
+
+    def save_models(self, save_dir):
         os.makedirs(save_dir, exist_ok=True)
-        checkpoint = {
-            'epoch': epoch,
-            'generator': self.generator.state_dict(),
-            'style_encoder': self.style_encoder.state_dict(),
-            'discriminator': self.discriminator.state_dict(),
-            'ema_generator': self.ema_generator.state_dict(),
-            'ema_style_encoder': self.ema_style_encoder.state_dict(),
-            'g_optimizer': self.g_optimizer.state_dict(),
-            'd_optimizer': self.d_optimizer.state_dict(),
-            'g_scheduler': self.g_scheduler.state_dict(),
-            'd_scheduler': self.d_scheduler.state_dict(),
+        # Save main models and optimizers
+        torch.save({
+            'G_A2B': self.G_A2B.state_dict(), 'G_B2A': self.G_B2A.state_dict(),
+            'SE_A': self.SE_A.state_dict(), 'SE_B': self.SE_B.state_dict(),
+            'D_A': self.D_A.state_dict(), 'D_B': self.D_B.state_dict(),
+            'g_optimizer': self.g_optimizer.state_dict(), 'd_optimizer': self.d_optimizer.state_dict(),
+            'g_scheduler': self.g_scheduler.state_dict(), 'd_scheduler': self.d_scheduler.state_dict(),
             'loss_history': self.loss_history,
-            'weight_history': self.weight_scheduler.weight_history,
-            'loss_scheduler_history': self.weight_scheduler.loss_history,
-        }
-        torch.save(checkpoint, os.path.join(save_dir, 'checkpoint.pth'))
-        print(f"Checkpoint saved at epoch {epoch}")
-    
-    def load_checkpoint(self, checkpoint_path):
-        """Loads a model checkpoint"""
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint not found: {checkpoint_path}")
+            'num_domains': self.num_domains
+        }, os.path.join(save_dir, 'checkpoint.pth'))
+        # Save EMA models separately
+        torch.save({
+            'ema_G_A2B': self.ema_G_A2B.state_dict(), 'ema_G_B2A': self.ema_G_B2A.state_dict(),
+            'ema_SE_A': self.ema_SE_A.state_dict(), 'ema_SE_B': self.ema_SE_B.state_dict()
+        }, os.path.join(save_dir, 'ema_checkpoint.pth'))
+        print(f"Models successfully saved to {save_dir}")
+
+    def load_models(self, checkpoint_dir):
+        ckpt_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+        if not os.path.exists(ckpt_path):
+            print(f"Checkpoint not found at {ckpt_path}. Starting from scratch.")
             return 0
+            
+        print(f"Loading checkpoint from {ckpt_path}...")
+        ckpt = torch.load(ckpt_path, map_location=self.device)
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.generator.load_state_dict(checkpoint['generator'])
-        self.style_encoder.load_state_dict(checkpoint['style_encoder'])
-        self.discriminator.load_state_dict(checkpoint['discriminator'])
-        self.ema_generator.load_state_dict(checkpoint['ema_generator'])
-        self.ema_style_encoder.load_state_dict(checkpoint['ema_style_encoder'])
-        self.g_optimizer.load_state_dict(checkpoint['g_optimizer'])
-        self.d_optimizer.load_state_dict(checkpoint['d_optimizer'])
-        self.g_scheduler.load_state_dict(checkpoint['g_scheduler'])
-        self.d_scheduler.load_state_dict(checkpoint['d_scheduler'])
-        self.loss_history = checkpoint.get('loss_history', {})
+        # Verify domain compatibility
+        saved_num_domains = ckpt.get('num_domains', 2)  # Default for backward compatibility
+        if saved_num_domains != self.num_domains:
+            print(f"Warning: Saved model has {saved_num_domains} domains, but current model expects {self.num_domains}")
+            return 0
+            
+        self.G_A2B.load_state_dict(ckpt['G_A2B']); self.G_B2A.load_state_dict(ckpt['G_B2A'])
+        self.SE_A.load_state_dict(ckpt['SE_A']); self.SE_B.load_state_dict(ckpt['SE_B'])
+        self.D_A.load_state_dict(ckpt['D_A']); self.D_B.load_state_dict(ckpt['D_B'])
+        self.g_optimizer.load_state_dict(ckpt['g_optimizer']); self.d_optimizer.load_state_dict(ckpt['d_optimizer'])
+        self.g_scheduler.load_state_dict(ckpt['g_scheduler']); self.d_scheduler.load_state_dict(ckpt['d_scheduler'])
+        self.loss_history = ckpt.get('loss_history', self.loss_history)
+
+        # Load EMA models
+        ema_ckpt_path = os.path.join(checkpoint_dir, 'ema_checkpoint.pth')
+        if os.path.exists(ema_ckpt_path):
+            ema_ckpt = torch.load(ema_ckpt_path, map_location=self.device)
+            self.ema_G_A2B.load_state_dict(ema_ckpt['ema_G_A2B']); self.ema_G_B2A.load_state_dict(ema_ckpt['ema_G_B2A'])
+            self.ema_SE_A.load_state_dict(ema_ckpt['ema_SE_A']); self.ema_SE_B.load_state_dict(ema_ckpt['ema_SE_B'])
         
-        if 'weight_history' in checkpoint:
-            self.weight_scheduler.weight_history = checkpoint['weight_history']
-        if 'loss_scheduler_history' in checkpoint:
-            self.weight_scheduler.loss_history = checkpoint['loss_scheduler_history']
-        
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+        print(f"Models successfully loaded from {checkpoint_dir}")
+        start_epoch = len(self.loss_history.get('G_loss', []))
         return start_epoch
+        
+    def plot_losses(self, save_path):
+        if not self.loss_history or not any(v for k, v in self.loss_history.items() if k in ['G_loss', 'D_loss']): return
+        plt.figure(figsize=(12, 8))
+        epochs = range(1, len(self.loss_history['G_loss']) + 1)
+        for loss_type, values in self.loss_history.items():
+            if values: plt.plot(epochs, values, label=loss_type)
+        plt.legend(); plt.xlabel('Epochs'); plt.ylabel('Loss'); plt.title('Training Losses Over Epochs')
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.savefig(save_path, dpi=300); plt.close()
+
+    def generate_cyclegan_style_grid(self, batch):
+        """Generate single 2x2 grid: Real A, Fake B, Real B, Fake A"""
+        with torch.no_grad():
+            # Get first sample from batch
+            real_A = batch['source'][0:1].to(self.device)  # Source
+            real_B = batch['target'][0:1].to(self.device)  # Target
+            y_org = batch['source_domain'][0:1].to(self.device)  # Source domain 
+            y_trg = batch['target_domain'][0:1].to(self.device)  # Target domain
+            
+            # Extract styles
+            style_A = self.ema_SE_A(real_A, y_org)  # Style of source
+            style_B = self.ema_SE_B(real_B, y_trg)  # Style of target
+            
+            # Generate translations
+            fake_B = self.ema_G_A2B(real_A, style_B)  # A → B
+            fake_A = self.ema_G_B2A(real_B, style_A)  # B → A
+            
+            # Create 2x2 grid: [Real A, Fake B, Real B, Fake A]
+            grid = torch.cat([real_A, fake_B, real_B, fake_A], dim=0)
+            
+            return grid, y_trg[0].item()
+        """Generate Real/Fake pairs for a specific target domain (CycleGAN style)"""
+        with torch.no_grad():
+            # Get source images (limited number for cleaner visualization)
+            source_images = torch.stack(fixed_samples['source'][:num_samples]).to(self.device)
+            
+            # Get real target domain images
+            if target_domain_idx in fixed_samples['targets'] and len(fixed_samples['targets'][target_domain_idx]) > 0:
+                real_target_images = torch.stack(
+                    fixed_samples['targets'][target_domain_idx][:num_samples]
+                ).to(self.device)
+                
+                # Use first target image as style reference
+                ref_img = real_target_images[:1]
+                domain_tensor = torch.tensor([target_domain_idx], device=self.device)
+                style_B = self.ema_SE_B(ref_img, domain_tensor)
+                
+                # Generate fake images by translating source to target domain style
+                fake_images = []
+                for src_img in source_images:
+                    fake = self.ema_G_A2B(src_img.unsqueeze(0), style_B)
+                    fake_images.append(fake)
+                fake_batch = torch.cat(fake_images, dim=0)
+                
+                # Create Real/Fake pairs: [Real1, Fake1, Real2, Fake2, ...]
+                samples = []
+                for i in range(num_samples):
+                    if i < len(real_target_images):
+                        samples.append(real_target_images[i:i+1])
+                    if i < len(fake_batch):
+                        samples.append(fake_batch[i:i+1])
+                
+                return torch.cat(samples, dim=0) if samples else source_images
+            
+            return source_images
 
 
-def train(model, dataset, cfg, start_epoch=0):
-    """Main training loop, includes asymmetric updates"""
+def train_multi_domain_style_cyclegan(model, dataset, cfg, start_epoch=0):
+    """
+    The main training loop for multi-domain StyleCycleGAN.
+    """
     save_dir = os.path.join(cfg.save_dir_base, cfg.EXPERIMENT_NAME)
-    sample_dir = os.path.join(save_dir, 'samples')
-    checkpoint_dir = os.path.join(save_dir, 'checkpoints')
-    os.makedirs(sample_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    images_dir = os.path.join(save_dir, 'images')
+    checkpoints_dir = os.path.join(save_dir, 'checkpoints')
     
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
     dataloader = DataLoader(
         dataset, batch_size=cfg.batch_size, shuffle=True, 
-        num_workers=cfg.NUM_WORKERS, pin_memory=True, drop_last=True
+        num_workers=4, pin_memory=True, drop_last=True
     )
     
-    fixed_samples = dataset.get_fixed_samples(num_samples=4)
-    
+    # W&B: Watch models to log gradients and parameters
     if cfg.wandb:
-        wandb.watch(
-            models=(model.generator, model.style_encoder, model.discriminator),
-            log_freq=100
-        )
-        
-    # --- Added: Set G/D update ratio ---
-    g_update_ratio = 2  # Update generator 5 times for every 1 discriminator update
-    print(f"Training will proceed with a G:D ratio of {g_update_ratio}:1.")
-
-    d_losses_log_buffer = {} # Used to buffer the D loss logs
-
+        wandb.watch(models=(model.G_A2B, model.G_B2A, model.SE_A, model.SE_B, model.D_A, model.D_B), log_freq=50)
+    
     for epoch in range(start_epoch, cfg.epochs):
-        epoch_losses = {}
-        epoch_g_losses = {}
+        # Reset per-epoch loss storage
+        for k in model.current_epoch_losses.keys(): model.current_epoch_losses[k] = []
         
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{cfg.epochs}')
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f'Epoch {epoch+1}/{cfg.epochs}')
         
-        for i, batch in enumerate(pbar):
-            if i == 0:
-                dynamic_weights = model.weight_scheduler.get_current_weights(
-                    epoch, epoch_g_losses if epoch_g_losses else {}
-                )
-                print(f"\nEpoch {epoch+1} dynamic weights: {dynamic_weights}")
+        for i, batch in pbar:
+            losses = model.train_step(batch, epoch)
+            # Store batch losses for epoch average
+            for k, v in losses.items(): model.current_epoch_losses[k].append(v.item())
+            pbar.set_postfix({k: f'{v.item():.3f}' for k, v in losses.items()})
             
-            # --- Modified training steps ---
-            # 1. Train the generator (executes every iteration)
-            g_losses_log, g_losses_raw = model.train_g_step(batch, dynamic_weights)
-            
-            # 2. Train the discriminator according to the ratio
-            if i % g_update_ratio == 0:
-                d_losses_log = model.train_d_step(batch)
-                d_losses_log_buffer = d_losses_log # Update the D loss log
-                
-            # Combine logs for display
-            current_log = {**g_losses_log, **d_losses_log_buffer}
+            # W&B: Log step-wise losses
+            if cfg.wandb:
+                step_logs = {f"loss/{k}": v.item() for k, v in losses.items()}
+                wandb.log(step_logs)
 
-            for k, v in g_losses_raw.items():
-                if k not in epoch_g_losses: epoch_g_losses[k] = []
-                epoch_g_losses[k].append(v.item() if torch.is_tensor(v) else v)
-            
-            pbar.set_postfix({k: f'{v:.3f}' for k, v in current_log.items()})
-            
-            for k, v in current_log.items():
-                if k not in epoch_losses: epoch_losses[k] = []
-                epoch_losses[k].append(v)
-            
-            if cfg.wandb and i % 10 == 0:
-                log_dict = {f'step/{k}': v for k, v in current_log.items()}
-                for k, v in dynamic_weights.items():
-                    log_dict[f'weight/{k}'] = v
-                wandb.log(log_dict)
-            
+            # Save sample images periodically - Classic CycleGAN 2x2 format
             if i % cfg.save_freq == 0:
-                with torch.no_grad():
-                    all_rows = []
-                    num_samples_per_domain = 2
-                    
-                    # Get a new batch to generate images to avoid using a batch already in training
-                    try:
-                        vis_batch = next(iter(dataloader))
-                    except StopIteration:
-                        vis_batch = batch # If the dataloader is exhausted, use the current batch
+                # Generate single 2x2 grid from current batch
+                grid, target_domain_idx = model.generate_cyclegan_style_grid(batch)
+                domain_name = dataset.domains[target_domain_idx] if target_domain_idx < len(dataset.domains) else f"Domain_{target_domain_idx}"
+                
+                # Labels for 2x2 grid: Real A, Fake B, Real B, Fake A
+                labels = [
+                    f"Real A ({dataset.domains[0]})",     # Top-left: Source
+                    f"Fake B ({domain_name})",            # Top-right: A→B  
+                    f"Real B ({domain_name})",            # Bottom-left: Target
+                    f"Fake A ({dataset.domains[0]})"     # Bottom-right: B→A
+                ]
+                
+                save_sample_grid(
+                    grid,
+                    os.path.join(images_dir, f'epoch_{epoch+1:03d}_batch_{i:04d}_{domain_name}.png'),
+                    nrow=2,  # 2x2 grid
+                    domain_names=labels
+                )
 
-                    for src_idx in range(min(num_samples_per_domain, vis_batch['source'].size(0))):
-                        source = vis_batch['source'][src_idx:src_idx+1].to(model.device)
-                        row = [source]
-                        
-                        for domain_idx in range(1, dataset.num_domains):
-                            if domain_idx in fixed_samples['targets'] and len(fixed_samples['targets'][domain_idx]) > 0:
-                                ref_idx = i % len(fixed_samples['targets'][domain_idx])
-                                ref = fixed_samples['targets'][domain_idx][ref_idx].unsqueeze(0).to(model.device)
-                                y_trg = torch.tensor([domain_idx], device=model.device)
-                                
-                                s = model.ema_style_encoder(ref, y_trg)
-                                fake = model.ema_generator(source, s)
-                                row.append(fake)
-                        
-                        if len(row) > 1:
-                            all_rows.append(torch.cat(row, dim=0))
-                    
-                    if all_rows:
-                        samples_grid = torch.cat(all_rows, dim=0)
-                        save_image(
-                            samples_grid,
-                            os.path.join(sample_dir, f'epoch_{epoch+1:03d}_iter_{i:05d}.png'),
-                            nrow=dataset.num_domains,
-                            normalize=True,
-                            value_range=(-1, 1)
-                        )
-        
-        avg_g_losses = {k: np.mean(v) for k, v in epoch_g_losses.items()}
-        avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
-        
-        for k, v in avg_losses.items():
-            if k not in model.loss_history: model.loss_history[k] = []
-            model.loss_history[k].append(v)
-        
+        # Calculate and store average losses for the epoch
+        epoch_avg_losses = {f"avg_loss/{k}": np.mean(v_list) for k, v_list in model.current_epoch_losses.items() if v_list}
+        for k, v_list in model.current_epoch_losses.items():
+            if v_list: model.loss_history[k].append(np.mean(v_list))
+
+        # W&B: Log epoch-level metrics
         if cfg.wandb:
-            epoch_log = {'epoch': epoch + 1}
-            epoch_log.update({f'epoch/{k}': v for k, v in avg_losses.items()})
-            epoch_log['lr/generator'] = model.g_scheduler.get_last_lr()[0]
-            epoch_log['lr/discriminator'] = model.d_scheduler.get_last_lr()[0]
-            for k, v in dynamic_weights.items():
-                epoch_log[f'epoch_weight/{k}'] = v
-            wandb.log(epoch_log)
-        
-        model.g_scheduler.step()
-        model.d_scheduler.step()
-        
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == cfg.epochs:
-            checkpoint_path = os.path.join(checkpoint_dir, f'epoch_{epoch+1:03d}')
-            model.save_checkpoint(checkpoint_path, epoch)
-            
-            model.weight_scheduler.plot_weight_history(
-                save_path=os.path.join(save_dir, 'weight_history.png')
-            )
-        
-        if len(model.loss_history) > 0:
-            plt.figure(figsize=(12, 8))
-            for key, values in model.loss_history.items():
-                if len(values) > 0: plt.plot(values, label=key)
-            plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.title('Training Losses')
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            plt.grid(True); plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, 'loss_curves.png'))
-            plt.close()
-    
-    model.weight_scheduler.plot_weight_history(
-        save_path=os.path.join(save_dir, 'weight_history.png')
-    )
-    
-    print("Training complete!")
+            epoch_logs = { "epoch": epoch + 1, **epoch_avg_losses }
+            epoch_logs["lr/generator"] = model.g_scheduler.get_last_lr()[0]
+            epoch_logs["lr/discriminator"] = model.d_scheduler.get_last_lr()[0]
+            for name, weight in model.weight_scheduler.current_weights.items():
+                epoch_logs[f"weight/{name}"] = weight
+            wandb.log(epoch_logs)
 
+        # Step the LR schedulers
+        model.g_scheduler.step(); model.d_scheduler.step()
+        
+        # Generate and save loss plots
+        model.plot_losses(os.path.join(save_dir, 'losses.png'))
+        model.weight_scheduler.plot_weight_history(os.path.join(save_dir, 'weight_history.png'))
+
+        # Save model checkpoint
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == cfg.epochs:
+            checkpoint_dir = os.path.join(checkpoints_dir, f'epoch_{epoch+1}')
+            model.save_models(checkpoint_dir)
+
+    print("Multi-domain training completed!")

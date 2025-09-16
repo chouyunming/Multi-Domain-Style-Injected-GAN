@@ -1,168 +1,95 @@
+import os
 import torch
 import numpy as np
-import scipy.linalg
 import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
 from torchvision.utils import save_image
-import os
+
+
+def add_text_to_image(img_tensor, text):
+    """
+    Adds text with a shadow to a PyTorch image tensor for better visibility.
+    """
+    img_np = img_tensor.cpu().float().numpy()
+    # Convert from the range [-1, 1] to [0, 1]
+    img_np = (img_np * 0.5 + 0.5).clip(0, 1)
+    img_np = np.transpose(img_np, (1, 2, 0))
+    img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+    
+    draw = ImageDraw.Draw(img_pil)
+    
+    try:
+        # A larger default font
+        font = ImageFont.load_default(size=15)
+    except (AttributeError, TypeError): 
+        # Fallback for older Pillow versions
+        font = ImageFont.load_default()
+    
+    text_color = "white"
+    shadow_color = "black"
+    x, y = 10, 10
+    # Add a simple shadow by drawing the text in black at offset positions
+    for offset in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        draw.text((x + offset[0], y + offset[1]), text, font=font, fill=shadow_color)
+    # Draw the main text
+    draw.text((x, y), text, font=font, fill=text_color)
+    
+    img_np = np.array(img_pil) / 255.0
+    img_np = np.transpose(img_np, (2, 0, 1))
+    img_tensor = torch.from_numpy(img_np).float()
+    # Convert back to the range [-1, 1] for consistency
+    return (img_tensor * 2 - 1)
+
+
+def save_sample_grid(samples_grid, path, nrow=4, domain_names=None):
+    """
+    Saves a grid of samples with optional text labels.
+    
+    Args:
+        samples_grid: Tensor of shape [num_samples, C, H, W]
+        path: Path to save the image
+        nrow: Number of images per row
+        domain_names: List of labels for each image (optional)
+    """
+    if domain_names is not None and len(domain_names) > 0:
+        # Add text labels to images
+        labeled_samples = []
+        
+        for i in range(samples_grid.size(0)):
+            if i < len(domain_names):
+                label = domain_names[i]
+                labeled_img = add_text_to_image(samples_grid[i], label)
+                labeled_samples.append(labeled_img)
+            else:
+                labeled_samples.append(samples_grid[i])
+        
+        samples_grid = torch.stack(labeled_samples)
+    
+    save_image(samples_grid, path, nrow=nrow, normalize=True, value_range=(-1, 1))
+
 
 class EMA:
     """
-    Exponential Moving Average for model parameters.
-    This helps stabilize training and improves generation quality.
+    Exponential Moving Average (EMA) for model parameters.
+    Applying EMA to the generator weights can lead to more stable and higher-quality
+    image generation during inference.
     """
-    def __init__(self, beta=0.999):
+    def __init__(self, beta):
         self.beta = beta
-        self.step = 0
     
     def update_model_average(self, ma_model, current_model):
-        """Update the moving average model."""
-        self.step += 1
-        
-        # Bias correction
-        decay = min(self.beta, (1 + self.step) / (10 + self.step))
-        
+        """
+        Update the moving average model with the current model's parameters.
+        """
         for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-            if current_params.requires_grad:
-                old_weight = ma_params.data
-                new_weight = current_params.data
-                ma_params.data = decay * old_weight + (1 - decay) * new_weight
+            old_weight, up_weight = ma_params.data, current_params.data
+            ma_params.data = self.update_average(old_weight, up_weight)
+    
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
 
-def denormalize(tensor):
-    """Convert tensor from [-1, 1] to [0, 1]."""
-    return (tensor + 1) / 2
-
-def save_debug_image(tensors, filepath, nrow=8):
-    """Save a grid of images for debugging."""
-    tensors = denormalize(tensors)
-    save_image(tensors, filepath, nrow=nrow)
-
-def plot_loss_curves(loss_history, save_path):
-    """Plot training loss curves."""
-    if not loss_history:
-        return
-    
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    axes = axes.flatten()
-    
-    # Group losses by type
-    d_losses = {k: v for k, v in loss_history.items() if k.startswith('D/')}
-    g_losses = {k: v for k, v in loss_history.items() if k.startswith('G/')}
-    
-    # Plot discriminator losses
-    if d_losses:
-        ax = axes[0]
-        for key, values in d_losses.items():
-            if len(values) > 0:
-                ax.plot(values, label=key)
-        ax.set_title('Discriminator Losses')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
-        ax.legend()
-        ax.grid(True)
-    
-    # Plot generator losses
-    if g_losses:
-        for idx, (key, values) in enumerate(g_losses.items(), 1):
-            if idx < len(axes) and len(values) > 0:
-                ax = axes[idx]
-                ax.plot(values)
-                ax.set_title(key)
-                ax.set_xlabel('Iteration')
-                ax.set_ylabel('Loss')
-                ax.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-def generate_translation_grid(generator, style_encoder, source_images, 
-                             ref_images_dict, device):
-    """
-    Generate a grid showing translations to multiple domains.
-    
-    Args:
-        generator: Generator model
-        style_encoder: Style encoder model
-        source_images: Tensor of source images [N, 3, H, W]
-        ref_images_dict: Dict mapping domain_idx to reference images
-        device: Device to run on
-    
-    Returns:
-        Grid tensor
-    """
-    generator.eval()
-    style_encoder.eval()
-    
-    rows = []
-    
-    with torch.no_grad():
-        for src_img in source_images:
-            src_img = src_img.unsqueeze(0).to(device)
-            row = [src_img]
-            
-            for domain_idx, ref_imgs in sorted(ref_images_dict.items()):
-                if len(ref_imgs) > 0:
-                    ref_img = ref_imgs[0].unsqueeze(0).to(device)
-                    y = torch.tensor([domain_idx], device=device)
-                    
-                    # Extract style and generate
-                    style = style_encoder(ref_img, y)
-                    fake = generator(src_img, style)
-                    row.append(fake)
-            
-            rows.append(torch.cat(row, dim=0))
-    
-    return torch.cat(rows, dim=0)
-
-def compute_fid_score(real_features, fake_features):
-    """
-    Compute Fréchet Inception Distance between real and fake features.
-    This is a placeholder - you would need to extract features using InceptionV3.
-    """
-    # Compute statistics
-    mu_real = np.mean(real_features, axis=0)
-    mu_fake = np.mean(fake_features, axis=0)
-    
-    sigma_real = np.cov(real_features, rowvar=False)
-    sigma_fake = np.cov(fake_features, rowvar=False)
-    
-    # Compute FID
-    diff = mu_real - mu_fake
-    covmean = scipy.linalg.sqrtm(sigma_real @ sigma_fake)
-    
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    
-    fid = diff @ diff + np.trace(sigma_real + sigma_fake - 2 * covmean)
-    return fid
-
-def setup_logger(log_dir):
-    """Setup logging for training."""
-    import logging
-    
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Create logger
-    logger = logging.getLogger('multidomain')
-    logger.setLevel(logging.INFO)
-    
-    # File handler
-    fh = logging.FileHandler(os.path.join(log_dir, 'training.log'))
-    fh.setLevel(logging.INFO)
-    
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    
-    # Formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-    
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    
-    return logger
 
 class DynamicWeightScheduler:
     """
@@ -184,7 +111,8 @@ class DynamicWeightScheduler:
         # 1. Update loss history
         for k, v in current_losses.items():
             if k in self.loss_history:
-                self.loss_history[k].append(v.detach().cpu().item())
+                loss_value = v.detach().cpu().item() if hasattr(v, 'detach') else v
+                self.loss_history[k].append(loss_value)
 
         # 2. Calculate warmup factor
         warmup_factor = min(1.0, (epoch + 1) / self.warmup_epochs)

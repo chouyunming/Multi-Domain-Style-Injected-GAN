@@ -163,3 +163,65 @@ def setup_logger(log_dir):
     logger.addHandler(ch)
     
     return logger
+
+class DynamicWeightScheduler:
+    """
+    Dynamically adjusts the weights of different loss components during training.
+    This scheduler implements a warmup phase followed by a cosine decay phase,
+    which can help stabilize training in the early stages and refine the model later.
+    """
+    def __init__(self, init_weights, warmup_epochs=10, decay_epochs=100, total_epochs=200):
+        self.init_weights = init_weights
+        self.current_weights = init_weights.copy()
+        self.warmup_epochs = warmup_epochs
+        self.decay_end_epoch = warmup_epochs + decay_epochs
+        self.total_epochs = total_epochs
+        
+        self.loss_history = {k: [] for k in init_weights.keys()}
+        self.weight_history = {k: [] for k in init_weights.keys()}
+
+    def get_current_weights(self, epoch, current_losses):
+        # 1. Update loss history
+        for k, v in current_losses.items():
+            if k in self.loss_history:
+                self.loss_history[k].append(v.detach().cpu().item())
+
+        # 2. Calculate warmup factor
+        warmup_factor = min(1.0, (epoch + 1) / self.warmup_epochs)
+
+        # 3. Calculate decay factor (Cosine decay)
+        decay_factor = 1.0
+        if epoch >= self.warmup_epochs:
+            progress = min(1.0, (epoch - self.warmup_epochs) / (self.decay_end_epoch - self.warmup_epochs))
+            # Cosine decay from 1 down to 0
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            # Rescale to decay from 1 down to a minimum of 0.1
+            decay_factor = 0.1 + 0.9 * cosine_decay
+
+        # 4. Update weights and record history
+        for k in self.current_weights.keys():
+            self.current_weights[k] = self.init_weights[k] * warmup_factor * decay_factor
+            self.weight_history[k].append(self.current_weights[k])
+            
+        return self.current_weights
+
+    def plot_weight_history(self, save_path=None):
+        """
+        Plots the evolution of the loss weights over epochs and saves the plot.
+        """
+        if not any(self.weight_history.values()):
+            return
+        plt.figure(figsize=(15, 8))
+        for k, v in self.weight_history.items():
+            if v:
+                plt.plot(v, label=k, linewidth=2)
+        plt.title('Loss Weight Evolution Over Training')
+        plt.xlabel('Epochs')
+        plt.ylabel('Weight Value')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.6)
+        
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()

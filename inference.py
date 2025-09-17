@@ -9,7 +9,8 @@ import glob
 import random
 
 import config as default_config
-from model import build_model
+# FIX 1: Import the correct models instead of build_model
+from model import StyleCycleGANGenerator, MultiDomainStyleEncoder
 from dataset import InferenceDataset
 
 import warnings
@@ -18,26 +19,45 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 def load_model(checkpoint_path, img_size, style_dim, num_domains, device):
     """Load trained multi-domain model."""
-    # Build model
-    generator, style_encoder, _ = build_model(
-        img_size, style_dim, num_domains, device
-    )
+    print(f"Loading multi-domain model with {num_domains} domains...")
+    
+    # FIX 2: Build models using the correct architecture
+    generator = StyleCycleGANGenerator(
+        in_channels=3, 
+        out_channels=3, 
+        style_dim=style_dim
+    ).to(device)
+    
+    style_encoder = MultiDomainStyleEncoder(
+        style_dim=style_dim, 
+        num_domains=num_domains
+    ).to(device)
     
     # Load checkpoint
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
+    print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Load EMA models if available, otherwise use regular models
-    if 'ema_generator' in checkpoint:
-        generator.load_state_dict(checkpoint['ema_generator'])
-        style_encoder.load_state_dict(checkpoint['ema_style_encoder'])
-        print("Loaded EMA models")
-    else:
-        generator.load_state_dict(checkpoint['generator'])
-        style_encoder.load_state_dict(checkpoint['style_encoder'])
-        print("Loaded regular models")
+    # FIX 3: Load using the correct checkpoint keys
+    try:
+        # Try EMA models first
+        if 'ema_G_A2B' in checkpoint:
+            generator.load_state_dict(checkpoint['ema_G_A2B'])
+            style_encoder.load_state_dict(checkpoint['ema_SE_B'])  # Use SE_B for target domain
+            print("Loaded EMA models")
+        elif 'G_A2B' in checkpoint:
+            generator.load_state_dict(checkpoint['G_A2B'])
+            style_encoder.load_state_dict(checkpoint['SE_B'])  # Use SE_B for target domain
+            print("Loaded regular models")
+        else:
+            print(f"Available keys: {list(checkpoint.keys())}")
+            raise KeyError("Could not find expected model keys in checkpoint")
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        print("Please ensure the checkpoint was saved with the multi-domain trainer")
+        raise
     
     generator.eval()
     style_encoder.eval()
@@ -79,10 +99,10 @@ def preload_style_vectors(style_encoder, ref_domain_dir, domain_idx,
             img = Image.open(style_path).convert('RGB')
             img_tensor = transform(img).unsqueeze(0).to(device)
             
-            # Create domain label tensor
+            # FIX 4: Create domain label tensor for multi-domain encoder
             y = torch.tensor([domain_idx], device=device)
             
-            # Extract style
+            # Extract style using multi-domain encoder
             style_code = style_encoder(img_tensor, y)
             style_vectors.append(style_code)
     
@@ -158,23 +178,31 @@ def main(args):
     
     # Load model
     checkpoint_path = os.path.join(args.checkpoint_dir, 'checkpoint.pth')
-    generator, style_encoder = load_model(
-        checkpoint_path, 
-        args.image_size, 
-        args.style_dim,
-        num_domains,
-        device
-    )
+    try:
+        generator, style_encoder = load_model(
+            checkpoint_path, 
+            args.image_size, 
+            args.style_dim,
+            num_domains,
+            device
+        )
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        return
     
     # Preload style vectors from target domain
-    style_vectors = preload_style_vectors(
-        style_encoder,
-        target_domain_path,
-        target_domain_idx,
-        args.image_size,
-        device,
-        max_styles=args.max_styles
-    )
+    try:
+        style_vectors = preload_style_vectors(
+            style_encoder,
+            target_domain_path,
+            target_domain_idx,
+            args.image_size,
+            device,
+            max_styles=args.max_styles
+        )
+    except Exception as e:
+        print(f"Failed to load style vectors: {e}")
+        return
     
     # Setup output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -197,40 +225,36 @@ def main(args):
     # Process images
     with torch.no_grad():
         for idx in tqdm(range(len(dataset)), desc="Generating translations"):
-            img_tensor, img_name = dataset[idx]
-            img_tensor = img_tensor.unsqueeze(0).to(device)
-            
-            # Get style based on mode
-            if fixed_style is not None:
-                style = fixed_style
-            else:
-                style = apply_style_mode(
-                    style_vectors, 
-                    args.style_mode,
-                    args.noise_level
+            try:
+                img_tensor, img_name = dataset[idx]
+                img_tensor = img_tensor.unsqueeze(0).to(device)
+                
+                # Get style based on mode
+                if fixed_style is not None:
+                    style = fixed_style
+                else:
+                    style = apply_style_mode(
+                        style_vectors, 
+                        args.style_mode,
+                        args.noise_level
+                    )
+                
+                # Generate translation
+                fake = generator(img_tensor, style)
+                
+                # Save result
+                output_path = os.path.join(output_subdir, img_name)
+                save_image(
+                    fake,
+                    output_path,
+                    normalize=True,
+                    value_range=(-1, 1)
                 )
-            
-            # Generate translation
-            fake = generator(img_tensor, style)
-            
-            # Save result
-            output_path = os.path.join(output_subdir, img_name)
-            save_image(
-                fake,
-                output_path,
-                normalize=True,
-                value_range=(-1, 1)
-            )
+            except Exception as e:
+                print(f"Error processing {img_name}: {e}")
+                continue
     
     print(f"\nInference complete! Results saved to: {output_subdir}")
-    
-    # Generate comparison grid if requested
-    if args.save_grid:
-        print("Generating comparison grid...")
-        generate_comparison_grid(
-            dataset, generator, style_vectors, 
-            target_domain_idx, device, output_subdir
-        )
 
 
 def generate_comparison_grid(dataset, generator, style_vectors, 

@@ -9,10 +9,6 @@ TARGET_DIR = "./data/ref2"  # Parent directory containing all target domains
 GPU = 0
 IMAGE_SIZE = 256
 
-# Model architecture
-STYLE_DIM = 64  # Dimension of style code
-# N_RESIDUAL_BLOCKS = 6  # Number of residual blocks in generator
-
 # Training settings
 SAVE_DIR_BASE = './results'
 EXPERIMENT_NAME = 'multidomain_exp'
@@ -43,10 +39,10 @@ RESUME_CHECKPOINT = None
 # ===================================================================
 # Multi-Domain StyleCycleGAN Inference Settings
 # ===================================================================
-INFERENCE_INPUT_DIR = './experiments/plant_village_raw/synthetic_target/Tomato_healthy'
-INFERENCE_TARGET_DOMAINS_DIR = './stylecyclegan/dataset/target_domains'
-INFERENCE_CHECKPOINT_DIR = './stylecyclegan/results/multi_domain_experiment/checkpoints/epoch_180'
-INFERENCE_OUTPUT_DIR = './stylecyclegan/output/multi_domain/interpolate'
+INFERENCE_INPUT_DIR = './synthetic_target/Tomato_healthy'
+INFERENCE_TARGET_DOMAINS_DIR = './data/ref'
+INFERENCE_CHECKPOINT_DIR = './results/multidomain_exp/checkpoints/epoch_180'
+INFERENCE_OUTPUT_DIR = './output/multidomain_exp/interpolate'
 INFERENCE_TARGET_DOMAIN = 1  # Which target domain to translate to (1, 2, 3, ...)
 
 INFERENCE_USE_EMA = True
@@ -55,7 +51,7 @@ INFERENCE_USE_EMA = True
 # Style Extracting Mode for Multi-Domain
 # choices=['average', 'random', 'interpolate', 'specific_domain']
 # ===================================================================
-INFERENCE_STYLE_MODE = 'specific_domain'
+INFERENCE_STYLE_MODE = 'interpolate'
 INFERENCE_DOMAIN_ID = 1  # Specific domain to use for style extraction
 INFERENCE_NOISE_LEVEL = 0.1
 

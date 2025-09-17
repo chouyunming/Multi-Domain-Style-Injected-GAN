@@ -43,7 +43,7 @@ INFERENCE_INPUT_DIR = './synthetic_target/Tomato_healthy'
 INFERENCE_TARGET_DOMAINS_DIR = './data/ref'
 INFERENCE_CHECKPOINT_DIR = './results/multidomain_exp/checkpoints/epoch_180'
 INFERENCE_OUTPUT_DIR = './output/multidomain_exp/interpolate'
-INFERENCE_TARGET_DOMAIN = 1  # Which target domain to translate to (1, 2, 3, ...)
+INFERENCE_TARGET_DOMAIN = 'Tomato_Bacterial_spot'
 
 INFERENCE_USE_EMA = True
 

@@ -9,7 +9,6 @@ import glob
 import random
 
 import config as default_config
-# FIX 1: Import the correct models instead of build_model
 from model import StyleCycleGANGenerator, MultiDomainStyleEncoder
 from dataset import InferenceDataset
 
@@ -17,11 +16,11 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def load_model(checkpoint_path, img_size, style_dim, num_domains, device):
+def load_model(checkpoint_path, style_dim, num_domains, device):
     """Load trained multi-domain model."""
     print(f"Loading multi-domain model with {num_domains} domains...")
     
-    # FIX 2: Build models using the correct architecture
+    # Build models using the correct architecture
     generator = StyleCycleGANGenerator(
         in_channels=3, 
         out_channels=3, 
@@ -33,31 +32,44 @@ def load_model(checkpoint_path, img_size, style_dim, num_domains, device):
         num_domains=num_domains
     ).to(device)
     
-    # Load checkpoint
+    # Get the directory containing checkpoint.pth
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    
+    # Load main checkpoint
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     print(f"Loading checkpoint from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # FIX 3: Load using the correct checkpoint keys
-    try:
-        # Try EMA models first
-        if 'ema_G_A2B' in checkpoint:
-            generator.load_state_dict(checkpoint['ema_G_A2B'])
-            style_encoder.load_state_dict(checkpoint['ema_SE_B'])  # Use SE_B for target domain
-            print("Loaded EMA models")
-        elif 'G_A2B' in checkpoint:
+    # Check if we should load EMA models (preferred for inference)
+    ema_checkpoint_path = os.path.join(checkpoint_dir, 'ema_checkpoint.pth')
+    if os.path.exists(ema_checkpoint_path):
+        # Load EMA models
+        print("Loading EMA models from ema_checkpoint.pth...")
+        ema_checkpoint = torch.load(ema_checkpoint_path, map_location=device, weights_only=False)
+        try:
+            generator.load_state_dict(ema_checkpoint['ema_G_A2B'])
+            style_encoder.load_state_dict(ema_checkpoint['ema_SE_B'])  # Use SE_B for target domain
+            print("Successfully loaded EMA models")
+        except KeyError as e:
+            print(f"Error loading EMA models: {e}")
+            print(f"Available EMA keys: {list(ema_checkpoint.keys())}")
+            # Fall back to regular models
+            print("Falling back to regular models...")
+            generator.load_state_dict(checkpoint['G_A2B'])
+            style_encoder.load_state_dict(checkpoint['SE_B'])
+    else:
+        # Load regular models
+        print("EMA checkpoint not found, loading regular models...")
+        try:
             generator.load_state_dict(checkpoint['G_A2B'])
             style_encoder.load_state_dict(checkpoint['SE_B'])  # Use SE_B for target domain
-            print("Loaded regular models")
-        else:
-            print(f"Available keys: {list(checkpoint.keys())}")
-            raise KeyError("Could not find expected model keys in checkpoint")
-    except Exception as e:
-        print(f"Error loading models: {e}")
-        print("Please ensure the checkpoint was saved with the multi-domain trainer")
-        raise
+            print("Successfully loaded regular models")
+        except KeyError as e:
+            print(f"Error loading models: {e}")
+            print(f"Available checkpoint keys: {list(checkpoint.keys())}")
+            raise
     
     generator.eval()
     style_encoder.eval()
@@ -96,15 +108,22 @@ def preload_style_vectors(style_encoder, ref_domain_dir, domain_idx,
     style_vectors = []
     with torch.no_grad():
         for style_path in tqdm(style_files, desc="Extracting styles"):
-            img = Image.open(style_path).convert('RGB')
-            img_tensor = transform(img).unsqueeze(0).to(device)
-            
-            # FIX 4: Create domain label tensor for multi-domain encoder
-            y = torch.tensor([domain_idx], device=device)
-            
-            # Extract style using multi-domain encoder
-            style_code = style_encoder(img_tensor, y)
-            style_vectors.append(style_code)
+            try:
+                img = Image.open(style_path).convert('RGB')
+                img_tensor = transform(img).unsqueeze(0).to(device)
+                
+                # Create domain label tensor for multi-domain encoder
+                y = torch.tensor([domain_idx], device=device)
+                
+                # Extract style using multi-domain encoder
+                style_code = style_encoder(img_tensor, y)
+                style_vectors.append(style_code)
+            except Exception as e:
+                print(f"Warning: Failed to process style image {style_path}: {e}")
+                continue
+    
+    if not style_vectors:
+        raise ValueError(f"No valid style vectors could be extracted from {ref_domain_dir}")
     
     print(f"Loaded {len(style_vectors)} style vectors")
     return style_vectors
@@ -153,7 +172,17 @@ def apply_style_mode(style_vectors, mode, noise_level=0.1):
 def main(args):
     # Setup device
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu >= 0 else 'cpu')
-    print(f"Using device: {device}")
+    
+    # Check if output is being redirected to suppress verbose logging
+    is_redirected = not os.isatty(1)  # Check if stdout is redirected
+    
+    if not is_redirected:
+        print(f"Starting inference with target domain: {args.target_domain}")
+        print(f"Input directory: {args.input_dir}")
+        print(f"Reference domains directory: {args.ref_domains_dir}")
+        print(f"Checkpoint directory: {args.checkpoint_dir}")
+        print(f"Output directory: {args.output_dir}")
+        print(f"Using device: {device}")
     
     # Discover domains (source is domain 0, targets start from 1)
     domain_dirs = [d for d in os.listdir(args.ref_domains_dir) 
@@ -165,7 +194,8 @@ def main(args):
     if num_target_domains == 0:
         raise ValueError(f"No domains found in {args.ref_domains_dir}")
     
-    print(f"Found {num_target_domains} target domains: {domain_dirs}")
+    if not is_redirected:
+        print(f"Found {num_target_domains} target domains: {domain_dirs}")
     
     # Find target domain index (add 1 because source is 0)
     if args.target_domain not in domain_dirs:
@@ -174,21 +204,25 @@ def main(args):
     target_domain_idx = domain_dirs.index(args.target_domain) + 1  # +1 because source is 0
     target_domain_path = os.path.join(args.ref_domains_dir, args.target_domain)
     
-    print(f"Target domain: {args.target_domain} (index: {target_domain_idx})")
+    if not is_redirected:
+        print(f"Target domain: {args.target_domain} (index: {target_domain_idx})")
     
     # Load model
     checkpoint_path = os.path.join(args.checkpoint_dir, 'checkpoint.pth')
     try:
         generator, style_encoder = load_model(
             checkpoint_path, 
-            args.image_size, 
             args.style_dim,
             num_domains,
             device
         )
+        if not is_redirected:
+            print("Model loaded successfully")
     except Exception as e:
         print(f"Failed to load model: {e}")
-        return
+        import traceback
+        traceback.print_exc()
+        return 1  # Return error code
     
     # Preload style vectors from target domain
     try:
@@ -200,22 +234,32 @@ def main(args):
             device,
             max_styles=args.max_styles
         )
+        if not is_redirected:
+            print("Style vectors loaded successfully")
     except Exception as e:
         print(f"Failed to load style vectors: {e}")
-        return
+        import traceback
+        traceback.print_exc()
+        return 1  # Return error code
     
     # Setup output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    output_subdir = os.path.join(args.output_dir, f'{args.target_domain}_{args.style_mode}')
-    os.makedirs(output_subdir, exist_ok=True)
     
     # Load source images
-    dataset = InferenceDataset(args.input_dir, args.image_size)
+    try:
+        dataset = InferenceDataset(args.input_dir, args.image_size)
+        if not is_redirected:
+            print(f"Loaded dataset with {len(dataset)} images")
+    except Exception as e:
+        print(f"Failed to load dataset: {e}")
+        return 1
     
     if len(dataset) == 0:
-        raise ValueError(f"No images found in {args.input_dir}")
+        print(f"WARNING: No images found in {args.input_dir}")
+        return 1  # Return error code
     
-    print(f"Processing {len(dataset)} images with style mode: {args.style_mode}")
+    if not is_redirected:
+        print(f"Processing {len(dataset)} images with style mode: {args.style_mode}")
     
     # Fixed style for 'average' mode
     fixed_style = None
@@ -223,6 +267,9 @@ def main(args):
         fixed_style = apply_style_mode(style_vectors, 'average')
     
     # Process images
+    processed_count = 0
+    failed_count = 0
+    
     with torch.no_grad():
         for idx in tqdm(range(len(dataset)), desc="Generating translations"):
             try:
@@ -243,55 +290,28 @@ def main(args):
                 fake = generator(img_tensor, style)
                 
                 # Save result
-                output_path = os.path.join(output_subdir, img_name)
+                output_path = os.path.join(args.output_dir, img_name)
                 save_image(
                     fake,
                     output_path,
                     normalize=True,
                     value_range=(-1, 1)
                 )
+                processed_count += 1
+                
             except Exception as e:
                 print(f"Error processing {img_name}: {e}")
+                failed_count += 1
                 continue
     
-    print(f"\nInference complete! Results saved to: {output_subdir}")
-
-
-def generate_comparison_grid(dataset, generator, style_vectors, 
-                            domain_idx, device, output_dir):
-    """Generate a grid showing different style modes."""
-    # Select a few source images
-    num_samples = min(4, len(dataset))
-    modes = ['specific', 'average', 'random', 'interpolate', 'noise']
+    if not is_redirected:
+        print(f"\nInference complete!")
+        print(f"Successfully processed: {processed_count} images")
+        print(f"Failed: {failed_count} images")
+        print(f"Results saved to: {args.output_dir}")
     
-    grid = []
-    
-    for i in range(num_samples):
-        img_tensor, _ = dataset[i]
-        img_tensor = img_tensor.unsqueeze(0).to(device)
-        
-        # Add source image
-        row = [img_tensor]
-        
-        # Generate with different modes
-        for mode in modes:
-            style = apply_style_mode(style_vectors, mode, noise_level=0.1)
-            with torch.no_grad():
-                fake = generator(img_tensor, style)
-            row.append(fake)
-        
-        grid.append(torch.cat(row, dim=0))
-    
-    # Save grid
-    grid = torch.cat(grid, dim=0)
-    save_image(
-        grid,
-        os.path.join(output_dir, 'style_modes_comparison.png'),
-        nrow=len(modes) + 1,
-        normalize=True,
-        value_range=(-1, 1)
-    )
-    print(f"Comparison grid saved to {output_dir}/style_modes_comparison.png")
+    # Return success if at least some images were processed
+    return 0 if processed_count > 0 else 1
 
 
 if __name__ == "__main__":
@@ -300,7 +320,7 @@ if __name__ == "__main__":
     # Paths
     parser.add_argument('--input_dir', type=str, default=default_config.INFERENCE_INPUT_DIR,
                         help='Directory containing source images')
-    parser.add_argument('--ref_domains_dir', type=str, default=default_config.INFERENCE_REF_DOMAINS_DIR,
+    parser.add_argument('--ref_domains_dir', type=str, default=default_config.INFERENCE_TARGET_DOMAINS_DIR,
                         help='Directory containing all reference domain folders')
     parser.add_argument('--checkpoint_dir', type=str, default=default_config.INFERENCE_CHECKPOINT_DIR,
                         help='Directory containing model checkpoint')
@@ -333,4 +353,7 @@ if __name__ == "__main__":
                         help='Save comparison grid of different style modes')
     
     args = parser.parse_args()
-    main(args)
+    
+    # Run main and exit with its return code
+    import sys
+    sys.exit(main(args))

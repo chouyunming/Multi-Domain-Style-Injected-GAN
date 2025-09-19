@@ -2,6 +2,7 @@
 # ===================================================================
 # Multi-Domain Style-Injected GAN Training Settings
 # ===================================================================
+NAME="Alan"
 
 # Data paths
 SOURCE_DIR = "./data/src/Tomato_Healthy"  # Single source domain

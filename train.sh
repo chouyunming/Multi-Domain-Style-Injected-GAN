@@ -27,4 +27,26 @@ python main.py \
 echo "--- Experiment 1 Finished ---"
 echo ""
 
+# # ========================= EXPERIMENT 2 ==========================
+echo "--- Preparing Experiment 2: ---"
+
+EXP2_NAME='multidomain_exp1_all'
+EXP2_LR_G=2e-4
+EXP2_LR_D=1e-4
+EXP2_WEIGHTS='{"gan": 1.0, "cycle": 10.0, "identity": 5.0, "style": 1.0, "content": 1.0}'
+
+python main.py \
+  --exp_name "$EXP2_NAME" \
+  --source_dir "$SOURCE_DIR" \
+  --target_dir "./data/ref_all" \
+  --epochs $EPOCHS \
+  --batch_size $BATCH_SIZE \
+  --lr_g $EXP2_LR_G \
+  --lr_d $EXP2_LR_D \
+  --loss_weights "$EXP2_WEIGHTS" \
+  --wandb
+
+echo "--- Experiment 2 Finished ---"
+echo ""
+
 echo "All experiments completed."

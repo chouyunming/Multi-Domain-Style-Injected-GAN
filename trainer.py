@@ -1,4 +1,3 @@
-# trainer.py
 import os
 import copy
 import torch
@@ -8,51 +7,41 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
-# W&B for experiment tracking
 import wandb
-
-# Import from our new modules
-from model import StyleCycleGANGenerator, MultiDomainStyleEncoder, MultiDomainDiscriminator
-from losses import VGGStyleContentLoss
+from model import Generator, StyleEncoder, Discriminator
+from losses import VGGBasedLoss
 from utils import EMA, DynamicWeightScheduler, save_sample_grid
 
-class MultiDomainStyleCycleGAN:
-    """
-    Multi-domain StyleCycleGAN trainer.
-    This extends the original StyleCycleGAN to work with multiple target domains
-    using domain-specific branches in the style encoder and discriminator.
-    """
+class MSIGAN:
     def __init__(self, device, total_epochs, lr_g, lr_d, loss_weights, num_domains):
         self.device = device
         self.num_domains = num_domains
 
-        # --- Instantiate Models ---
         # Generators (unchanged - they work with style codes)
-        self.G_A2B = StyleCycleGANGenerator().to(device)
-        self.G_B2A = StyleCycleGANGenerator().to(device)
+        self.G_A2B = Generator().to(device)
+        self.G_B2A = Generator().to(device)
         
         # Multi-domain Style Encoders
-        self.SE_A = MultiDomainStyleEncoder(num_domains=num_domains).to(device)
-        self.SE_B = MultiDomainStyleEncoder(num_domains=num_domains).to(device)
+        self.SE_A = StyleEncoder(num_domains=num_domains).to(device)
+        self.SE_B = StyleEncoder(num_domains=num_domains).to(device)
         
         # Multi-domain Discriminators
-        self.D_A = MultiDomainDiscriminator(num_domains=num_domains).to(device)
-        self.D_B = MultiDomainDiscriminator(num_domains=num_domains).to(device)
+        self.D_A = Discriminator(num_domains=num_domains).to(device)
+        self.D_B = Discriminator(num_domains=num_domains).to(device)
 
-        # --- Instantiate EMA Models for Inference ---
         self.ema = EMA(beta=0.995)
         self.ema_G_A2B = copy.deepcopy(self.G_A2B).eval()
         self.ema_G_B2A = copy.deepcopy(self.G_B2A).eval()
         self.ema_SE_A = copy.deepcopy(self.SE_A).eval()
         self.ema_SE_B = copy.deepcopy(self.SE_B).eval()
 
-        # --- Define Loss Functions ---
+        # --- Loss Functions ---
         self.criterion_gan = nn.MSELoss().to(device)
         self.criterion_cycle = nn.L1Loss().to(device)
         self.criterion_identity = nn.L1Loss().to(device)
-        self.criterion_style_content = VGGStyleContentLoss(device).to(device)
+        self.criterion_style_content = VGGBasedLoss(device).to(device)
 
-        # --- Define Optimizers ---
+        # --- Optimizers ---
         g_params = list(self.G_A2B.parameters()) + list(self.G_B2A.parameters()) + \
                    list(self.SE_A.parameters()) + list(self.SE_B.parameters())
         self.g_optimizer = torch.optim.Adam(g_params, lr=lr_g, betas=(0.5, 0.999))
@@ -60,7 +49,7 @@ class MultiDomainStyleCycleGAN:
         d_params = list(self.D_A.parameters()) + list(self.D_B.parameters())
         self.d_optimizer = torch.optim.Adam(d_params, lr=lr_d, betas=(0.5, 0.999))
 
-        # --- Define Learning Rate Schedulers ---
+        # --- Learning Rate Schedulers ---
         self.g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.g_optimizer, T_max=total_epochs, eta_min=1e-6)
         self.d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.d_optimizer, T_max=total_epochs, eta_min=1e-6)
         
@@ -72,10 +61,6 @@ class MultiDomainStyleCycleGAN:
         self.current_epoch_losses = {k: [] for k in self.loss_history.keys()}
 
     def train_step(self, batch, epoch):
-        """
-        Training step modified to handle multi-domain data.
-        """
-        # Extract data from batch
         real_A = batch['source'].to(self.device)  # Source domain images
         real_B = batch['target'].to(self.device)  # Target domain images
         y_org = batch['source_domain'].to(self.device)  # Source domain indices (always 0)
@@ -85,9 +70,7 @@ class MultiDomainStyleCycleGAN:
         valid = torch.ones((real_A.size(0), 1, *self.D_A(real_A, y_org).shape[2:]), device=self.device)
         fake = torch.zeros_like(valid)
 
-        # ==================================
-        #        Train Generators
-        # ==================================
+        # Train Generators
         self.g_optimizer.zero_grad()
         
         # Extract style codes using domain indices
@@ -103,7 +86,7 @@ class MultiDomainStyleCycleGAN:
         loss_gan_A2B = self.criterion_gan(self.D_B(fake_B, y_trg), valid)
         content_loss_B, style_loss_B = self.criterion_style_content(fake_B, real_B, real_A)
         
-        # For reverse direction, we translate back to source domain
+        # Translate back to source domain
         fake_A = self.G_B2A(real_B, style_A)  # Translate B to A's style
         loss_gan_B2A = self.criterion_gan(self.D_A(fake_A, y_org), valid)
         content_loss_A, style_loss_A = self.criterion_style_content(fake_A, real_A, real_B)
@@ -133,9 +116,7 @@ class MultiDomainStyleCycleGAN:
         self.ema.update_model_average(self.ema_SE_A, self.SE_A)
         self.ema.update_model_average(self.ema_SE_B, self.SE_B)
 
-        # ==================================
-        #      Train Discriminators
-        # ==================================
+        # Train Discriminators
         self.d_optimizer.zero_grad()
         
         # Real loss
@@ -237,7 +218,6 @@ class MultiDomainStyleCycleGAN:
             grid = torch.cat([real_A, fake_B, real_B, fake_A], dim=0)
             
             return grid, y_trg[0].item()
-        """Generate Real/Fake pairs for a specific target domain (CycleGAN style)"""
         with torch.no_grad():
             # Get source images (limited number for cleaner visualization)
             source_images = torch.stack(fixed_samples['source'][:num_samples]).to(self.device)
@@ -273,10 +253,7 @@ class MultiDomainStyleCycleGAN:
             return source_images
 
 
-def train_multi_domain_style_cyclegan(model, dataset, cfg, start_epoch=0):
-    """
-    The main training loop for multi-domain StyleCycleGAN.
-    """
+def train(model, dataset, cfg, start_epoch=0):
     save_dir = os.path.join(cfg.save_dir_base, cfg.EXPERIMENT_NAME)
     images_dir = os.path.join(save_dir, 'images')
     checkpoints_dir = os.path.join(save_dir, 'checkpoints')
@@ -318,10 +295,10 @@ def train_multi_domain_style_cyclegan(model, dataset, cfg, start_epoch=0):
                 
                 # Labels for 2x2 grid: Real A, Fake B, Real B, Fake A
                 labels = [
-                    f"Real A ({dataset.domains[0]})",     # Top-left: Source
-                    f"Fake B ({domain_name})",            # Top-right: A→B  
-                    f"Real B ({domain_name})",            # Bottom-left: Target
-                    f"Fake A ({dataset.domains[0]})"     # Bottom-right: B→A
+                    f"Real A ({dataset.domains[0]})",
+                    f"Fake B ({domain_name})",  
+                    f"Real B ({domain_name})",
+                    f"Fake A ({dataset.domains[0]})"
                 ]
                 
                 save_sample_grid(

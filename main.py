@@ -3,19 +3,12 @@ import argparse
 import json
 import os
 
-# W&B for experiment tracking
 import wandb
-
-# Import default configurations and modules from our new files
 import config as default_config
-from dataset import MultiDomainStyleTransferDataset
-from trainer import MultiDomainStyleCycleGAN, train_multi_domain_style_cyclegan
-
+from dataset import Custom
+from trainer import MSIGAN, train
 
 def main(cfg):
-    """
-    The main function to set up and run the multi-domain training experiment.
-    """
     # --- W&B Initialization ---
     if cfg.wandb:
         # Sanitize config dictionary for W&B
@@ -36,7 +29,6 @@ def main(cfg):
 
     print(f"--- Starting Multi-Domain Experiment: {cfg.EXPERIMENT_NAME} ---")
 
-    # --- Directory Validation ---
     if not os.path.exists(cfg.source_dir):
         print(f"ERROR: Source directory not found: {cfg.source_dir}")
         return
@@ -45,8 +37,7 @@ def main(cfg):
         print(f"ERROR: Target domains directory not found: {cfg.target_dir}")
         return
 
-    # --- Data Loading ---
-    dataset = MultiDomainStyleTransferDataset(cfg.source_dir, cfg.target_dir, cfg.image_size)
+    dataset = Custom(cfg.source_dir, cfg.target_dir, cfg.image_size)
     
     # Print dataset statistics
     print(f"\n{'='*60}")
@@ -65,7 +56,7 @@ def main(cfg):
     print(f"{'='*60}\n")
 
     # --- Model and Trainer Initialization ---
-    model = MultiDomainStyleCycleGAN(
+    model = MSIGAN(
         device=device, 
         total_epochs=cfg.epochs,
         lr_g=cfg.lr_g,
@@ -84,7 +75,7 @@ def main(cfg):
     # --- Start Training ---
     print("Starting multi-domain training...")
     try:
-        train_multi_domain_style_cyclegan(model, dataset, cfg, start_epoch=start_epoch)
+        train(model, dataset, cfg, start_epoch=start_epoch)
     except Exception as e:
         print(f"An error occurred during training: {e}")
         import traceback

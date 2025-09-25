@@ -9,25 +9,24 @@ import glob
 import random
 
 import config as default_config
-from model import StyleCycleGANGenerator, MultiDomainStyleEncoder
-from dataset import InferenceDataset
+from model import Generator, StyleEncoder
+from dataset import Inference
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def load_model(checkpoint_path, style_dim, num_domains, device):
-    """Load trained multi-domain model."""
     print(f"Loading multi-domain model with {num_domains} domains...")
     
     # Build models using the correct architecture
-    generator = StyleCycleGANGenerator(
+    generator = Generator(
         in_channels=3, 
         out_channels=3, 
         style_dim=style_dim
     ).to(device)
     
-    style_encoder = MultiDomainStyleEncoder(
+    style_encoder = StyleEncoder(
         style_dim=style_dim, 
         num_domains=num_domains
     ).to(device)
@@ -79,9 +78,6 @@ def load_model(checkpoint_path, style_dim, num_domains, device):
 
 def preload_style_vectors(style_encoder, ref_domain_dir, domain_idx, 
                          image_size, device, max_styles=None):
-    """
-    Preload style vectors from a reference domain directory.
-    """
     # Get all image files
     image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
     style_files = []
@@ -130,9 +126,6 @@ def preload_style_vectors(style_encoder, ref_domain_dir, domain_idx,
 
 
 def apply_style_mode(style_vectors, mode, noise_level=0.1):
-    """
-    Apply different style sampling strategies.
-    """
     if not style_vectors:
         raise ValueError("No style vectors provided")
     
@@ -247,7 +240,7 @@ def main(args):
     
     # Load source images
     try:
-        dataset = InferenceDataset(args.input_dir, args.image_size)
+        dataset = Inference(args.input_dir, args.image_size)
         if not is_redirected:
             print(f"Loaded dataset with {len(dataset)} images")
     except Exception as e:

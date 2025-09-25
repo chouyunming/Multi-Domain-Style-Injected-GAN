@@ -5,11 +5,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-class MultiDomainStyleTransferDataset(Dataset):
-    """
-    Multi-domain dataset for StyleCycleGAN.
-    Source domain is always index 0, target domains start from index 1.
-    """
+class Custom(Dataset):
     def __init__(self, source_root, target_root, image_size):
         super().__init__()
         self.image_size = image_size
@@ -91,7 +87,7 @@ class MultiDomainStyleTransferDataset(Dataset):
         return max(len(self.source_files), 
                   max(len(files) for files in self.target_files_by_domain.values()))
 
-class InferenceDataset(Dataset):
+class Inference(Dataset):
     """
     Dataset for inference - loads images from a single directory.
     """

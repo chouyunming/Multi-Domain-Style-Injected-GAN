@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-class VGGStyleContentLoss(nn.Module):
+class VGGBasedLoss(nn.Module):
     """
     Computes perceptual style and content losses using a pre-trained VGG19 network.
     The style loss is based on the Gram matrix of feature maps, while the content
